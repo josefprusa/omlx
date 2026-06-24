@@ -104,6 +104,31 @@ struct GlmDsaSparseMlaParams {
   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
 };
 
+struct GlmDsaSparseMlaQ8Params {
+  int B; ///< Batch Size
+  int H; ///< Query heads
+  int qL; ///< Query sequence length
+  int kL; ///< Key/value sequence length
+  int topk; ///< Number of selected tokens per query
+  int topk_valid_prefix; ///< Whether valid causal top-k entries precede invalids
+  int causal_prefix_indices; ///< Whether early causal rows use implicit 0..q indices
+  int has_topk_length; ///< Whether a per-query valid top-k prefix length exists
+  int causal_prefix_rows; ///< Number of leading query rows omitted from top-k
+
+  float scale; ///< Attention scale
+  int qL_off; ///< Offset in query sequence start
+
+  int64_t Q_latent_strides[3]; ///< Query latent strides (B, H, L, D = 1)
+  int64_t Q_pe_strides[3]; ///< Query PE strides (B, H, L, D = 1)
+  int64_t KV_packed_strides[3]; ///< KV packed-latent strides (B, 1, L, packed = 1), uint32 units
+  int64_t KV_scales_strides[3]; ///< KV latent scale strides (B, 1, L, groups = 1)
+  int64_t KV_biases_strides[3]; ///< KV latent bias strides (B, 1, L, groups = 1)
+  int64_t K_pe_strides[3]; ///< Key PE strides (B, 1, L, D = 1)
+  int64_t Topk_strides[3]; ///< Top-k strides (B, 1, L, topk = 1)
+  int64_t TopkLength_strides[2]; ///< Top-k length strides (B, L)
+  int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
+};
+
 struct GlmDsaSparseMlaBlockTableParams {
   int B; ///< Batch size
   int H; ///< Query heads

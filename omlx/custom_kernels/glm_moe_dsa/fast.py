@@ -62,6 +62,7 @@ NATIVE_SYMBOLS = (
     "dsa_indexer_scores",
     "dsa_topk_indices",
     "glm_dsa_sparse_mla_attention",
+    "glm_dsa_sparse_mla_attention_q8",
     "glm_dsa_exact_block_attention",
     "deepseek_v4_sparse_attention",
     "glm_dsa_q8_vup_flat",
@@ -206,6 +207,47 @@ def glm_dsa_sparse_mla_attention(
         topk_length=topk_length,
         causal_prefix_rows=causal_prefix_rows,
         stream=stream or mx.gpu,
+    )
+
+
+def glm_dsa_sparse_mla_attention_q8(
+    q_latent: mx.array,
+    q_pe: mx.array,
+    kv_packed: mx.array,
+    kv_scales: mx.array,
+    kv_biases: mx.array,
+    k_pe: mx.array,
+    topk_indices: mx.array,
+    scale: float,
+    group_size: int = 64,
+    bits: int = 8,
+    causal: bool = True,
+    topk_valid_prefix: bool = False,
+    causal_prefix_indices: bool = False,
+    topk_length: mx.array | None = None,
+    causal_prefix_rows: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    # int8-native sparse MLA: dequantizes the gathered top-k latent in-kernel.
+    # No mlx.core.fast fallback exists; callers gate on has_symbol() first.
+    return _ext.glm_dsa_sparse_mla_attention_q8(
+        q_latent,
+        q_pe,
+        kv_packed,
+        kv_scales,
+        kv_biases,
+        k_pe,
+        topk_indices,
+        scale,
+        group_size=group_size,
+        bits=bits,
+        causal=causal,
+        topk_valid_prefix=topk_valid_prefix,
+        causal_prefix_indices=causal_prefix_indices,
+        topk_length=topk_length,
+        causal_prefix_rows=causal_prefix_rows,
+        **_native_stream_kwargs(stream),
     )
 
 

@@ -36,6 +36,13 @@ from omlx.cache.type_handlers import CacheStateAxisInfo, CacheType, CacheTypeHan
 logger = logging.getLogger(__name__)
 
 
+def dequantize_latent(quant, group_size: int, bits: int):
+    """Dequantize a (packed, scales, biases) latent tuple to a dense fp16/bf16
+    array. Used on the fallback attention paths (exact-block / SDPA / short
+    context) that still expect a dense latent."""
+    return mx.dequantize(*quant, group_size=group_size, bits=bits)
+
+
 class Int8MLALatentCache(_BaseCache):
     """Quantized-latent + dense-k_pe cache for GLM MLA. Dequant-on-read."""
 
@@ -48,8 +55,12 @@ class Int8MLALatentCache(_BaseCache):
         self.group_size = group_size
         self.bits = bits
 
-    def update_and_fetch(self, keys, values):
+    def update_and_fetch(self, keys, values, return_quantized=False):
         # keys = latent [B, 1, S, kv_lora_rank]; values = k_pe [B, 1, S, rope_dim]
+        # return_quantized: hand back (packed, scales, biases), k_pe WITHOUT
+        # dequantizing — the int8-native sparse-MLA kernel dequants the gathered
+        # top-k in-kernel, so the full dense latent is never materialized (this
+        # is what removes the prefill-throttle death-spiral).
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
         prev = self.offset
@@ -88,10 +99,13 @@ class Int8MLALatentCache(_BaseCache):
             self.keys[i][..., prev : self.offset, :] = q[i]
         self.values[..., prev : self.offset, :] = values
 
-        # Dequant-on-read: hand back a dense latent so every consumer is unchanged.
         cur = tuple(x[..., : self.offset, :] for x in self.keys)
+        kp = self.values[..., : self.offset, :]
+        if return_quantized:
+            return cur, kp
+        # Dequant-on-read: hand back a dense latent so every consumer is unchanged.
         latent = mx.dequantize(*cur, group_size=self.group_size, bits=self.bits)
-        return latent, self.values[..., : self.offset, :]
+        return latent, kp
 
     def size(self):
         return self.offset
@@ -192,7 +206,7 @@ class BatchInt8MLALatentCache(_BaseCache):
         else:
             self.keys, self.values = new_k, new_v
 
-    def update_and_fetch(self, keys, values):
+    def update_and_fetch(self, keys, values, return_quantized=False):
         prev = self._idx
         if self.keys is None or (prev + keys.shape[2]) > self.values.shape[2]:
             B, H, _, k_head_dim = keys.shape
@@ -206,8 +220,11 @@ class BatchInt8MLALatentCache(_BaseCache):
         self.values[..., prev : self._idx, :] = values
 
         cur = tuple(x[..., : self._idx, :] for x in self.keys)
+        kp = self.values[..., : self._idx, :]
+        if return_quantized:
+            return cur, kp
         latent = mx.dequantize(*cur, group_size=self.group_size, bits=self.bits)
-        return latent, self.values[..., : self._idx, :]
+        return latent, kp
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:

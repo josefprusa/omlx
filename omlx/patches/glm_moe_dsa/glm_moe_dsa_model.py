@@ -22,7 +22,15 @@ from .sparse_mla import (
     exact_block_token_attention,
     q8_vup_flat,
     sparse_mla_attention,
+    sparse_mla_attention_q8,
 )
+from .int8_latent_cache import (
+    BatchInt8MLALatentCache,
+    Int8MLALatentCache,
+    dequantize_latent,
+)
+
+_INT8_LATENT_CACHES = (Int8MLALatentCache, BatchInt8MLALatentCache)
 
 
 def _native_sparse_mla_default_min_k() -> str:
@@ -207,8 +215,21 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 
         kv_latent = mx.expand_dims(kv_latent, axis=1)
 
+        # quant_latent holds the (packed, scales, biases) tuple when the int8
+        # cache returns the latent un-dequantized for the native int8 kernel;
+        # kv_latent stays None until a fallback path materializes it lazily.
+        quant_latent = None
+        q_gs = q_bits = 0
         if cache is not None:
-            kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
+            if isinstance(cache[0], _INT8_LATENT_CACHES):
+                q_gs = cache[0].group_size
+                q_bits = cache[0].bits
+                quant_latent, k_pe = cache[0].update_and_fetch(
+                    kv_latent, k_pe, return_quantized=True
+                )
+                kv_latent = None
+            else:
+                kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
         else:
             cache = [None] * 2
 
@@ -221,11 +242,29 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             topk_indices, _ = _parse_topk_state(topk_state)
             if topk_indices is not None:
                 idx = topk_indices[:, :, 0, :, None]
-                kv_latent = mx.take_along_axis(
-                    kv_latent,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
-                    axis=2,
-                )
+                if quant_latent is not None:
+                    # Gather the quantized top-k rows, then dequant ONLY those
+                    # ~2048 rows — never the full accumulated latent.
+                    packed, scales, biases = quant_latent
+                    pidx = mx.broadcast_to(idx, idx.shape[:-1] + (packed.shape[-1],))
+                    sidx = mx.broadcast_to(idx, idx.shape[:-1] + (scales.shape[-1],))
+                    kv_latent = dequantize_latent(
+                        (
+                            mx.take_along_axis(packed, pidx, axis=2),
+                            mx.take_along_axis(scales, sidx, axis=2),
+                            mx.take_along_axis(biases, sidx, axis=2),
+                        ),
+                        q_gs,
+                        q_bits,
+                    )
+                else:
+                    kv_latent = mx.take_along_axis(
+                        kv_latent,
+                        mx.broadcast_to(
+                            idx, idx.shape[:-1] + (kv_latent.shape[-1],)
+                        ),
+                        axis=2,
+                    )
                 k_pe = mx.take_along_axis(
                     k_pe,
                     mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
@@ -233,6 +272,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 )
                 if mask is not None:
                     mask = mx.take_along_axis(mask, topk_indices, axis=-1)
+            elif quant_latent is not None:
+                kv_latent = dequantize_latent(quant_latent, q_gs, q_bits)
 
             # Ensure the indexer cache is evaluated even if the topk_indices are unused
             # to keep the graph from getting too large.
@@ -317,43 +358,78 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         direct_sparse_mla_min_k = int(
             _native_sparse_mla_default_min_k()
         )
+        K = (
+            quant_latent[0].shape[2]
+            if quant_latent is not None
+            else kv_latent.shape[2]
+        )
+        latent_dim = 512 if quant_latent is not None else kv_latent.shape[-1]
         native_sparse_mla_shape = (
             topk_indices is not None
             and self.num_heads in (32, 64)  # 32 = tensor-sharded half of the 64 MLA heads
             and q_pe.shape[-1] == 64
-            and kv_latent.shape[-1] == 512
+            and latent_dim == 512
             and k_pe.shape[-1] == 64
             and topk_indices.shape[-1] == 2048
         )
+        # The int8-native q8 kernel only exists for bits=8 / group_size=64. For
+        # any other quant config there is no kernel, so don't route to it (it
+        # would return None and force a full-latent dequant fallback at large K).
+        native_quant_ok = quant_latent is None or (q_bits == 8 and q_gs == 64)
         direct_sparse_mla_requested = (
             native_sparse_mla_shape
+            and native_quant_ok
             and L > 1
-            and kv_latent.shape[2] >= direct_sparse_mla_min_k
+            and K >= direct_sparse_mla_min_k
         )
         if direct_sparse_mla_requested:
             fast_topk_indices = glm_fast.has("dsa_topk_indices")
             causal_prefix_indices = fast_topk_indices
             q_latent = self.embed_q(q_nope)
-            output = sparse_mla_attention(
-                q_latent,
-                q_pe,
-                kv_latent,
-                k_pe,
-                topk_indices,
-                self.scale,
-                topk_valid_prefix=fast_topk_indices,
-                causal_prefix_indices=causal_prefix_indices,
-                causal_prefix_rows=topk_prefix_rows,
-            )
+            if quant_latent is not None:
+                packed, scales, biases = quant_latent
+                output = sparse_mla_attention_q8(
+                    q_latent,
+                    q_pe,
+                    packed,
+                    scales,
+                    biases,
+                    k_pe,
+                    topk_indices,
+                    self.scale,
+                    group_size=q_gs,
+                    bits=q_bits,
+                    topk_valid_prefix=fast_topk_indices,
+                    causal_prefix_indices=causal_prefix_indices,
+                    causal_prefix_rows=topk_prefix_rows,
+                )
+            else:
+                output = sparse_mla_attention(
+                    q_latent,
+                    q_pe,
+                    kv_latent,
+                    k_pe,
+                    topk_indices,
+                    self.scale,
+                    topk_valid_prefix=fast_topk_indices,
+                    causal_prefix_indices=causal_prefix_indices,
+                    causal_prefix_rows=topk_prefix_rows,
+                )
             if output is not None:
                 output_flat = q8_vup_flat(
-                    output, self.unembed_out, key_length=kv_latent.shape[2]
+                    output, self.unembed_out, key_length=K
                 )
                 if output_flat is None:
                     output = self.unembed_out(output)
                     output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
                 output = output_flat
                 return self.o_proj(output), topk_state
+
+        # Fallback paths (exact-block / dense SDPA) require a dense latent. We
+        # only reach here below min_k or if the native kernel declined, so the
+        # context is small and the one-shot dequant transient is harmless.
+        if quant_latent is not None and kv_latent is None:
+            kv_latent = dequantize_latent(quant_latent, q_gs, q_bits)
 
         if topk_indices is not None and L > 8:
             k = self.embed_q(kv_latent, transpose=False)

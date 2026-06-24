@@ -62,6 +62,25 @@ NB_MODULE(_ext, m) {
       "causal_prefix_rows"_a = 0,
       "stream"_a = nb::none());
   m.def(
+      "glm_dsa_sparse_mla_attention_q8",
+      &omlx::glm_kernels::glm_dsa_sparse_mla_attention_q8,
+      "q_latent"_a,
+      "q_pe"_a,
+      "kv_packed"_a,
+      "kv_scales"_a,
+      "kv_biases"_a,
+      "k_pe"_a,
+      "topk_indices"_a,
+      "scale"_a,
+      "group_size"_a = 64,
+      "bits"_a = 8,
+      "causal"_a = true,
+      "topk_valid_prefix"_a = false,
+      "causal_prefix_indices"_a = false,
+      "topk_length"_a = nb::none(),
+      "causal_prefix_rows"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
       "glm_dsa_exact_block_attention",
       &omlx::glm_kernels::glm_dsa_exact_block_attention,
       "q"_a,

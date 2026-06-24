@@ -23,3 +23,22 @@ instantiate_sparse_mla(bfloat16, bfloat16_t, 256, 32, 64, 512, 64, 8);
 // H=32 of the 64 MLA heads. wm=4 keeps TQ = H / (wm * 8) = 1.
 instantiate_sparse_mla(float16, half, 256, 32, 32, 512, 64, 4);
 instantiate_sparse_mla(bfloat16, bfloat16_t, 256, 32, 32, 512, 64, 4);
+
+#define instantiate_sparse_mla_q8(tname, dtype, bk, dc, h, d, pe, wm, gs)   \
+  instantiate_kernel(                                                       \
+      "steel_sparse_mla_q8_" #tname "_bk" #bk "_dc" #dc "_h" #h            \
+      "_d" #d "_pe" #pe "_wm" #wm "_gs" #gs,                              \
+      sparse_mla_attention_q8,                                             \
+      dtype,                                                               \
+      bk,                                                                  \
+      dc,                                                                  \
+      h,                                                                   \
+      d,                                                                   \
+      pe,                                                                  \
+      wm,                                                                  \
+      gs,                                                                  \
+      uint,                                                                \
+      float)
+
+instantiate_sparse_mla_q8(float16, half, 256, 32, 64, 512, 64, 8, 64);
+instantiate_sparse_mla_q8(bfloat16, bfloat16_t, 256, 32, 64, 512, 64, 8, 64);

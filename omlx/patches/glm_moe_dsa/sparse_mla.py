@@ -478,6 +478,117 @@ def sparse_mla_attention(
     )
 
 
+def sparse_mla_attention_q8(
+    q_latent: mx.array,
+    q_pe: mx.array,
+    kv_packed: mx.array,
+    kv_scales: mx.array,
+    kv_biases: mx.array,
+    k_pe: mx.array,
+    topk_indices: mx.array,
+    scale: float,
+    *,
+    group_size: int = 64,
+    bits: int = 8,
+    topk_valid_prefix: bool = False,
+    causal_prefix_indices: bool = False,
+    topk_length: Optional[mx.array] = None,
+    causal_prefix_rows: int = 0,
+    stream: Optional[mx.Stream] = None,
+) -> Optional[mx.array]:
+    """int8-native sparse MLA prefill: latent KV arrives group-quantized
+    (packed uint32 + per-group scales/biases) and is dequantized for only the
+    gathered top-k rows inside the kernel. Same contract as
+    ``sparse_mla_attention`` otherwise.
+
+    Shapes:
+      q_latent: [B, H, L, 512]   q_pe: [B, H, L, 64]
+      kv_packed: [B, 1, K, 128]  kv_scales/kv_biases: [B, 1, K, 8]
+      k_pe: [B, 1, K, 64]        topk_indices: [B, 1, L, TOPK]
+    """
+    if (
+        q_latent.ndim != 4
+        or q_pe.ndim != 4
+        or kv_packed.ndim != 4
+        or kv_scales.ndim != 4
+        or kv_biases.ndim != 4
+        or k_pe.ndim != 4
+        or topk_indices.ndim != 4
+        or kv_packed.shape[1] != 1
+        or k_pe.shape[1] != 1
+    ):
+        return None
+
+    B, H, L, D_LATENT = q_latent.shape
+    K = kv_scales.shape[2]
+    D_PE = q_pe.shape[-1]
+    topk_rows = topk_indices.shape[2]
+    compact_prefix = causal_prefix_rows > 0 and topk_rows != L
+    pack_factor = 32 // bits
+
+    if (
+        L <= 1
+        or bits != 8
+        or group_size != 64
+        or q_pe.shape[:3] != (B, H, L)
+        or kv_packed.shape[:3] != (B, 1, K)
+        or kv_scales.shape[:3] != (B, 1, K)
+        or kv_biases.shape[:3] != (B, 1, K)
+        or k_pe.shape[:3] != (B, 1, K)
+        or topk_indices.shape[:2] != (B, 1)
+        or not (
+            topk_rows == L
+            or (
+                compact_prefix
+                and topk_rows + causal_prefix_rows == L
+                and causal_prefix_indices
+                and topk_valid_prefix
+            )
+        )
+        or D_LATENT != 512
+        or D_PE != 64
+        or kv_packed.shape[-1] != D_LATENT // pack_factor
+        or kv_scales.shape[-1] != D_LATENT // group_size
+        or kv_biases.shape[-1] != D_LATENT // group_size
+        or k_pe.shape[-1] != D_PE
+        or kv_packed.dtype != mx.uint32
+        or q_latent.dtype not in (mx.float16, mx.bfloat16)
+        or q_pe.dtype != q_latent.dtype
+        or kv_scales.dtype != q_latent.dtype
+        or kv_biases.dtype != q_latent.dtype
+        or k_pe.dtype != q_latent.dtype
+    ):
+        return None
+
+    if not hasattr(glm_fast, "glm_dsa_sparse_mla_attention_q8"):
+        return None
+
+    topk = (
+        topk_indices
+        if topk_indices.dtype == mx.uint32
+        else topk_indices.astype(mx.uint32)
+    )
+    if topk_length is not None and topk_length.dtype != mx.uint32:
+        topk_length = topk_length.astype(mx.uint32)
+    return glm_fast.glm_dsa_sparse_mla_attention_q8(
+        q_latent,
+        q_pe,
+        kv_packed,
+        kv_scales,
+        kv_biases,
+        k_pe,
+        topk,
+        scale,
+        group_size=group_size,
+        bits=bits,
+        topk_valid_prefix=topk_valid_prefix,
+        causal_prefix_indices=causal_prefix_indices,
+        topk_length=topk_length,
+        causal_prefix_rows=causal_prefix_rows,
+        stream=stream or mx.gpu,
+    )
+
+
 def q8_vup_flat(
     x: mx.array,
     unembed_out,

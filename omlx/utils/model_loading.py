@@ -640,6 +640,16 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         bits = int(getattr(model_settings, "int8_mla_kv_bits", 8) or 8)
         model._int8_mla_kv_bits = bits
         logger.info(f"int8 MLA-KV cache enabled: bits={bits}")
+        if bits != 8:
+            # Only the 8-bit sparse-MLA kernel is built. Other bit-widths still
+            # save KV memory but have NO native kernel, so long-context prefill
+            # falls back to dequant-on-read (slow). Use bits=8 for the fast path.
+            logger.warning(
+                "int8 MLA-KV bits=%d has no native sparse-MLA kernel; "
+                "long-context prefill will be slow (dequant-on-read). "
+                "Use bits=8 for the accelerated path.",
+                bits,
+            )
 
     return model
 

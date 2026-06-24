@@ -24,4 +24,22 @@ mx::array glm_dsa_sparse_mla_attention(
     int causal_prefix_rows = 0,
     mx::StreamOrDevice s = {});
 
+mx::array glm_dsa_sparse_mla_attention_q8(
+    const mx::array& q_latent,
+    const mx::array& q_pe,
+    const mx::array& kv_packed,
+    const mx::array& kv_scales,
+    const mx::array& kv_biases,
+    const mx::array& k_pe,
+    const mx::array& topk_indices,
+    float scale,
+    int group_size = 64,
+    int bits = 8,
+    bool causal = true,
+    bool topk_valid_prefix = false,
+    bool causal_prefix_indices = false,
+    const std::optional<mx::array>& topk_length = std::nullopt,
+    int causal_prefix_rows = 0,
+    mx::StreamOrDevice s = {});
+
 } // namespace omlx::glm_kernels

@@ -10,7 +10,9 @@ from omlx.patches.glm_moe_dsa.int8_latent_cache import (  # noqa: E402
     BatchInt8MLALatentCache,
     Int8MLALatentCache,
     Int8MLALatentCacheHandler,
+    dequantize_latent,
 )
+from omlx.patches.glm_moe_dsa.kernels import fast as glm_fast  # noqa: E402
 
 LR = 512  # kv_lora_rank
 RD = 64  # qk_rope_head_dim
@@ -179,6 +181,76 @@ def test_batch_update_after_merge():
     assert b.size() == 41 and lat.shape == (1, 1, 41, LR)
     assert float(mx.max(mx.abs(lat[:, :, 40:, :] - _quant_roundtrip(nx))).item()) == 0.0
     assert float(mx.max(mx.abs(kp[:, :, 40:, :] - npe)).item()) == 0.0
+
+
+def test_return_quantized_single_no_dequant():
+    mx.random.seed(20)
+    x = mx.random.normal((1, 1, 50, LR), dtype=mx.bfloat16)
+    kpe = mx.random.normal((1, 1, 50, RD), dtype=mx.bfloat16)
+    c = Int8MLALatentCache(bits=8, group_size=GS)
+    quant, kp = c.update_and_fetch(x, kpe, return_quantized=True)
+    # returns the (packed, scales, biases) tuple, NOT a dense latent
+    assert isinstance(quant, tuple) and len(quant) == 3
+    assert quant[0].dtype == mx.uint32 and quant[0].shape == (1, 1, 50, LR // 4)
+    mx.eval(*quant, kp)
+    # dequantizing it reproduces the dense read path exactly
+    deq = dequantize_latent(quant, GS, 8)
+    ref = _quant_roundtrip(x)
+    assert float(mx.max(mx.abs(deq - ref)).item()) == 0.0
+    assert float(mx.max(mx.abs(kp - kpe)).item()) == 0.0
+
+
+def test_return_quantized_batch_no_dequant():
+    c0, _, _ = _single(40, 21)
+    b = Int8MLALatentCache.merge([c0])
+    nx = mx.random.normal((1, 1, 1, LR), dtype=mx.bfloat16)
+    npe = mx.random.normal((1, 1, 1, RD), dtype=mx.bfloat16)
+    quant, kp = b.update_and_fetch(nx, npe, return_quantized=True)
+    assert isinstance(quant, tuple) and len(quant) == 3
+    assert quant[0].dtype == mx.uint32
+    deq = dequantize_latent(quant, b.group_size, b.bits)
+    mx.eval(deq, kp)
+    assert deq.shape == (1, 1, 41, LR)
+    assert float(mx.max(mx.abs(deq[:, :, 40:, :] - _quant_roundtrip(nx))).item()) == 0.0
+
+
+@pytest.mark.skipif(
+    not glm_fast.has("glm_dsa_sparse_mla_attention_q8")
+    or not glm_fast.has("glm_dsa_sparse_mla_attention"),
+    reason="native GLM kernels not built",
+)
+def test_q8_kernel_matches_dense():
+    # int8-native sparse-MLA must equal dequantize + dense sparse-MLA.
+    H, TOPK = 64, 2048
+    for dtype in (mx.float16, mx.bfloat16):
+        for K, L, flags in (
+            (4096, 4096, {}),
+            (4096, 512, {}),
+            (2048, 2048, dict(topk_valid_prefix=True, causal_prefix_indices=True)),
+        ):
+            mx.random.seed(7)
+            ql = (mx.random.normal((1, H, L, LR)) * 0.1).astype(dtype)
+            qp = (mx.random.normal((1, H, L, RD)) * 0.1).astype(dtype)
+            kv = (mx.random.normal((1, 1, K, LR)) * 0.1).astype(dtype)
+            kpe = (mx.random.normal((1, 1, K, RD)) * 0.1).astype(dtype)
+            packed, scales, biases = mx.quantize(kv, group_size=GS, bits=8)
+            kv_deq = mx.dequantize(packed, scales, biases, group_size=GS, bits=8)
+            topk = mx.random.randint(0, K, (1, 1, L, TOPK)).astype(mx.uint32)
+            topk = mx.concatenate(
+                [mx.zeros((1, 1, L, 1), dtype=mx.uint32), topk[..., 1:]], axis=-1
+            )
+            scale = 1.0 / (LR**0.5)
+            o_q8 = glm_fast.glm_dsa_sparse_mla_attention_q8(
+                ql, qp, packed, scales, biases, kpe, topk, scale,
+                group_size=GS, bits=8, **flags,
+            )
+            o_dn = glm_fast.glm_dsa_sparse_mla_attention(
+                ql, qp, kv_deq, kpe, topk, scale, **flags
+            )
+            mx.eval(o_q8, o_dn)
+            assert not bool(mx.any(mx.isnan(o_q8)).item())
+            md = float(mx.max(mx.abs(o_q8.astype(mx.float32) - o_dn.astype(mx.float32))).item())
+            assert md < 5e-2, f"{dtype} K={K} L={L} flags={flags} max_abs={md}"
 
 
 def test_batch_filter():
