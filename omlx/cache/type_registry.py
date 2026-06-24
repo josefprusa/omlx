@@ -73,6 +73,8 @@ class CacheTypeRegistry:
         "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
         "MiniMaxM3KVCache": CacheType.MINIMAX_M3_KVCACHE,
         "MiniMaxM3BatchKVCache": CacheType.MINIMAX_M3_BATCH_KVCACHE,
+        # GLM-5.2 int8 MLA latent cache; handler registered on glm_moe_dsa patch apply.
+        "Int8MLALatentCache": CacheType.INT8_MLA_LATENT,
     }
 
     # Default handler instance

@@ -632,6 +632,15 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         if applied:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
+    # int8 MLA-KV cache (GLM-5.2 glm_moe_dsa). make_cache reads _int8_mla_kv_bits;
+    # only the glm_moe_dsa Model honors it, so this is a no-op for other models.
+    if getattr(model_settings, "int8_mla_kv_enabled", False) and hasattr(
+        model, "make_cache"
+    ):
+        bits = int(getattr(model_settings, "int8_mla_kv_bits", 8) or 8)
+        model._int8_mla_kv_bits = bits
+        logger.info(f"int8 MLA-KV cache enabled: bits={bits}")
+
     return model
 
 

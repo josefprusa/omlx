@@ -500,10 +500,22 @@ class Model(DSV32Model):
 
     def make_cache(self):
         # Shared layers run no indexer, so they get no indexer KVCache.
+        # int8 MLA latent cache is opt-in (set by apply_post_load_transforms from
+        # model settings); the latent is stored int8 and dequantized on read, so
+        # attention is unchanged. Falls back to fp16 KVCache when disabled.
+        bits = getattr(self, "_int8_mla_kv_bits", None)
+
+        def _latent():
+            if bits:
+                from .int8_latent_cache import Int8MLALatentCache
+
+                return Int8MLALatentCache(bits=int(bits))
+            return KVCache()
+
         caches = []
         for layer in self.layers:
             if getattr(layer.self_attn, "skip_topk", False):
-                caches.append(CacheList(KVCache()))
+                caches.append(CacheList(_latent()))
             else:
-                caches.append(CacheList(KVCache(), KVCache()))
+                caches.append(CacheList(_latent(), KVCache()))
         return caches

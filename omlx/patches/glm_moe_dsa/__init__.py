@@ -55,6 +55,20 @@ def _register_module() -> None:
     logger.info("Registered %s from oMLX optimized vendored module", qualname)
 
 
+def _register_cache_handlers() -> None:
+    """Register the int8 MLA latent cache handler so omlx hot/SSD caching
+    round-trips Int8MLALatentCache. Idempotent (register overwrites by type)."""
+    try:
+        from omlx.cache.type_registry import CacheTypeRegistry
+
+        from .int8_latent_cache import Int8MLALatentCacheHandler
+
+        CacheTypeRegistry.register(Int8MLALatentCacheHandler())
+        logger.info("Int8MLALatentCacheHandler registered")
+    except Exception as e:  # pragma: no cover - non-fatal; cache falls back to default
+        logger.warning("Could not register Int8MLALatentCacheHandler: %s", e)
+
+
 def apply_glm_moe_dsa_patch() -> bool:
     """Apply the GLM MoE DSA patch. Idempotent.
 
@@ -74,6 +88,7 @@ def apply_glm_moe_dsa_patch() -> bool:
         return False
 
     _register_module()
+    _register_cache_handlers()
     from .generate_patch import apply_glm_moe_dsa_generate_patch
     from .nvfp4_ts import apply_glm_nvfp4_ts_patch
 

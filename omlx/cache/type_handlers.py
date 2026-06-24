@@ -40,6 +40,9 @@ class CacheType(Enum):
     BATCH_POOLING_CACHE = "BatchPoolingCache"
     MINIMAX_M3_KVCACHE = "MiniMaxM3KVCache"
     MINIMAX_M3_BATCH_KVCACHE = "MiniMaxM3BatchKVCache"
+    # GLM-5.2 int8-quantized MLA latent cache (handler in
+    # patches/glm_moe_dsa/int8_latent_cache.py, registered on patch apply).
+    INT8_MLA_LATENT = "Int8MLALatentCache"
 
 
 @dataclass

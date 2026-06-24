@@ -148,6 +148,12 @@ class ModelSettings:
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
 
+    # int8 MLA-KV cache (GLM-5.2 glm_moe_dsa only): store the MLA latent int8
+    # group-quantized and dequantize on read (~2x smaller latent KV; works with the
+    # hot RAM and SSD cold tiers). Independent of TurboQuant (which is MLA-disabled).
+    int8_mla_kv_enabled: bool = False
+    int8_mla_kv_bits: int = 8  # 8 = int8 (recommended); 4 trades accuracy for memory
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = (
