@@ -13,8 +13,19 @@
 
 A helper-level comparison cannot prove a serving-path claim. Verification scope must cover the claimed behavior.
 
+For converted checkpoints, use two independent gates:
+
+1. A header-level census proves the exact expected tensor names, shapes,
+   quantization triples, and absence of dropped feature residue.
+2. Deterministic byte parity recomputes representative tensors from the source
+   across module families and layer depths. It must compare packed weights,
+   scales, and biases, not only dequantized outputs.
+
+Finish with a strict real-artifact load and a deterministic generation probe.
+Strict loading alone proves tree compatibility, not conversion correctness.
+
 ## Provenance
 
-Approved in the upstream rebuild plan and aligned with current tests on 2026-07-11.
+Approved in the upstream rebuild plan and aligned with current tests on 2026-07-11. Revalidated by the 88-layer Puzzle artifact census and 12-source byte-parity samples in Nemotron experiment commit `ce739d7c`.
 
 Decay condition: revisit when test infrastructure, sampler semantics, or accepted numerical tolerances change.
