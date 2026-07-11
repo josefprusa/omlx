@@ -79,3 +79,82 @@ Every legacy path maps to exactly one capability ID below. The checker fails if 
 ## Update Rule
 
 Each reconstructed capability appends exact commits, test commands, benchmark artifacts, and its final keep/reject decision here. Durable conclusions move to `.llm-wiki/` only after human approval and wiki lint.
+
+## Reconstruction Results
+
+Verified on 2026-07-11 against baseline `d5fcb22a87c3b46ab6dd91016fbbbdb1e624f374`,
+MLX 0.32.0, and mlx-lm 0.31.3.
+
+### C-001 Scheduler and Cache
+
+- Branch: `rebuild/core`
+- Commit: `38093a76`
+- Kept: early prefix-index publication with selective rollback and
+  `OMLX_DISABLE_EARLY_INDEX_PUBLISH=1`; tracker-only transient clamp with
+  `OMLX_TRANSIENT_CLAMP_K=0` restoring the upstream max-of-three behavior.
+- Proof: 15 focused early-publish/clamp tests, including reader-before-persist,
+  mixed persisted/unpersisted prefixes, executor call order, and submit failure.
+- Broader gate:
+  `.venv/bin/python -m pytest tests/test_scheduler.py tests/test_paged_cache.py tests/test_paged_ssd_cache.py tests/test_prefix_cache.py tests/test_prefix_cache_rotating_tip_strip.py tests/test_prefix_cache_v4_block_storage.py tests/test_prefix_divergence_probe.py tests/test_store_cache_gate.py tests/test_hot_cache.py -q`
+  produced `586 passed`.
+- Decision: keep on `rebuild/core`; no experimental restore telemetry was ported.
+
+### E-001 GLM
+
+- Branch: `experiment/glm52-kernels-mtp`
+- Commit: `20b39c00`
+- Kept: optional NVFP4 global tensor scales for routed GLM experts. The current
+  `SwitchGLU` receives two guarded scale points instead of copying its entire
+  call method. The runtime scale fold matches prescaled-weight references in
+  both sorted and unsorted paths and has `OMLX_GLM_DISABLE_NVFP4_TS=1` for
+  attribution.
+- Proof: `10` focused tests; the broader GLM, MTP, loading, and settings gate
+  produced `229 passed, 4 skipped`. NVIDIA's NVFP4 specification independently
+  confirms the required block-scale times global-FP32-scale reconstruction.
+- Missing gate: the converted GLM oQNVFP4 runtime artifact is no longer present,
+  so no current real-checkpoint quality or target-Mac timing result exists.
+- Rejected: legacy `decode_kernels.py`. Current upstream native sparse MLA
+  covers fp16/bf16 and 32/64 heads, and already supplies native weighted sum and
+  q8 V-up. The old helper is shape-locked and has no current ABI benchmark.
+- Rejected: int8 MLA-KV promotion. The archived production dossier records the
+  feature as built but disabled because fp16 KV fits the deployed GLM model.
+- Decision: keep the scale fold experimental; do not promote any GLM commit to
+  core without a regenerated artifact and the full quality/benchmark gate.
+
+### E-003 and E-004 Nemotron
+
+- Branch: `experiment/nemotron-puzzle-oq`
+- Commits: `7adaf3b9`, `ce739d7c`, `90380bb0`
+- Kept: heterogeneous Puzzle model construction from per-layer
+  `block_configs`; deterministic oQ48 converter; exact offline census and byte
+  parity gate; NemotronH NVFP4 expert tensor-scale restoration for the baked
+  Ultra artifact.
+- Puzzle proof: real 47 GB artifact loaded in `6.67s`, bound all `88` layers,
+  exposed the expected layer-1 expert shape `(512, 1280, 128)` and top-k `4`,
+  and produced coherent output. The real offline gate covered all `88` layers
+  and `12` distributed byte-parity samples. Related gate: `107 passed`.
+- Ultra proof: real 327 GB baked artifact loaded in `46.31s`; all `108` layers,
+  `512`-element `fc1_ts`/`fc2_ts` sidecars, and the baked mamba, MoE-dense,
+  attention, and lm-head affine8 families were present. The runtime scale fold
+  engaged and greedy generation produced coherent output. Related gate:
+  `110 passed`.
+- Rejected: Puzzle fused router and fused expert pools, based on archived target
+  measurements showing a `7.3x` loss or unsafe command-buffer behavior.
+- Rejected after current rerun: Puzzle fused Mamba. Synthetic fp16/bf16 kernel
+  parity passed, but the real MLX 0.32 identity rail failed. One layer differed
+  by about `9.8e-4`; recurrent accumulation changed greedy output. All fusion
+  code was removed before commit.
+- Rejected: load-time Ultra DQ8 and sorted-route runtime patches. The deployed
+  artifact is already fully baked; recreating those transforms adds no serving
+  capability. The converter/runtime sidecar contract is the retained primitive.
+- Decision: keep the three isolated experiment commits. Puzzle base support and
+  conversion are promotion candidates after final branch review; Ultra scale
+  support remains tied to the marked artifact format.
+
+### U-003 Hy3
+
+- Current upstream base model and tool parser remain canonical.
+- The archived MTP delta has synthetic contract tests but no current sidecar
+  load, target-Mac speed result, or quality result.
+- Decision: do not create `experiment/hy3-mtp-delta`; preserve it as research
+  until a real current-model proof establishes a benefit.
