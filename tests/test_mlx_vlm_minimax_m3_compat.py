@@ -181,3 +181,60 @@ def test_ignored_layer_matching_covers_children():
     assert _is_ignored_layer("vision_tower", ("vision_tower",))
     assert _is_ignored_layer("vision_tower.block", ("vision_tower",))
     assert not _is_ignored_layer("language_model.block", ("vision_tower",))
+
+
+def test_minimax_nvfp4_tensor_scales_match_prescaled_weights():
+    import mlx.core as mx
+
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.models.minimax_m3_vl.language import (
+        MiniMaxPackedSwitchGLU,
+        MiniMaxSwiGLUOAI,
+    )
+
+    activation = MiniMaxSwiGLUOAI(1.702, 7.0, 1.0)
+    scaled = MiniMaxPackedSwitchGLU(2, 2, 2, activation, nvfp4_ts=True)
+    reference = MiniMaxPackedSwitchGLU(2, 2, 2, activation)
+
+    gate_up = mx.array(
+        [
+            [[0.2, -0.1], [0.3, 0.4], [0.5, -0.2], [0.1, 0.6]],
+            [[-0.3, 0.2], [0.7, -0.4], [0.2, 0.5], [-0.6, 0.1]],
+        ]
+    )
+    down = mx.array(
+        [
+            [[0.4, -0.2], [0.1, 0.3]],
+            [[-0.5, 0.2], [0.6, -0.1]],
+        ]
+    )
+    gate_up_ts = mx.array([[1.5, 0.75], [0.5, 1.25]])
+    down_ts = mx.ones((2,))
+
+    scaled.gate_up_proj.weight = gate_up
+    scaled.down_proj.weight = down
+    scaled.gate_up_ts = gate_up_ts
+    scaled.down_ts = down_ts
+
+    expanded = mx.concatenate(
+        [
+            mx.broadcast_to(gate_up_ts[:, :1], (2, 2)),
+            mx.broadcast_to(gate_up_ts[:, 1:], (2, 2)),
+        ],
+        axis=1,
+    )
+    reference.gate_up_proj.weight = gate_up * expanded[:, :, None]
+    reference.down_proj.weight = down
+
+    x = mx.array([[[0.25, -0.75]]])
+    indices = mx.array([[[0, 1]]])
+    actual = scaled(x, indices)
+    expected = reference(x, indices)
+    mx.eval(actual, expected)
+
+    assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-6).item()
