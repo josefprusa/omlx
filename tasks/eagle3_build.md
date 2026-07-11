@@ -116,7 +116,7 @@ Vendor served: vLLM num_speculative_tokens=3, block-size 128, enforce-eager, tar
 - Drafter interface (glm_moe_dsa_model.py): mtp_forward(hidden,next_token_ids,mtp_cache,return_hidden=)→(logits,hidden); make_mtp_cache();
   __call__(...,return_hidden,n_confirmed)→(logits,pre_norm_hidden); sanitize(). Markers: _omlx_mtp_decode_enabled, _omlx_mtp_warm_capable, is_mtp_active().
 - K: OMLX_MTP_DRAFT_K (default 1, clamp[1,7]), read ONCE at post-init (_draft_k:553). For dynamic-K → make per-cycle.
-- Accept logging: _MtpStats pos_attempts/pos_hits (1771-1784), _log_mtp_stats (1618) INFO always-on → a{i}=hits/attempts%. 
+- Accept logging: _MtpStats pos_attempts/pos_hits (1771-1784), _log_mtp_stats (1618) INFO always-on → a{i}=hits/attempts%.
 - Cache: target=prompt_cache (trim via _rollback_after_reject:1129 → block_size-(accepted+1)); draft=mtp_cache (trim _trim_mtp_spec:1717). 2-pass check-all-before-mutate.
 - Enable: model_settings.mtp_enabled → set_mtp_active → head attached at construction. NO env kill-switch (mtp_enabled only).
 - **GATE ISSUE**: _is_mtp_compatible (model_loading.py:442) lists qwen3_5/6, deepseek_v4, glm_moe_dsa — NOT minimax_m3. And M3 = VLM engine.
@@ -215,9 +215,9 @@ THEN: verify → mxfp8 A/B → final table → CLOSE.
 
 ### Finalization fixes DONE (Codex b153mn4h2): per-layer cache validation (every nonzero==expected else discard), capture gated by temp check both prefill paths, MTP StopIteration restored. 25+3 tests pass. Parse OK.
 ### LIVE VERIFY (server_m3s.log, mxfp8 restart):
-- temp guard WORKS: "EAGLE-3 routing skipped: temperature=1; rejection sampling is deferred" (x2). 
+- temp guard WORKS: "EAGLE-3 routing skipped: temperature=1; rejection sampling is deferred" (x2).
 - KEY CONFIG INTERACTION: fs5 model_settings has force_sampling=true+temp=1.0 → effective temp=1 even for temp=0 requests → spec SKIPPED for fs5 DEFAULT. So spec off-by-default on fs5 (correct v1 = greedy-only opt-in). The 26.49 tok/s "mxfp8 live" = baseline SAMPLED decode (spec skipped), NOT mxfp8-spec — confirms NO REGRESSION to normal serving.
-- mxfp8 drafter loads live: "eagle3 drafter mxfp8 g32". 
+- mxfp8 drafter loads live: "eagle3 drafter mxfp8 g32".
 - To measure mxfp8-SPEC: standalone harness (bypasses server temp guard) — RUNNING (bm7agnsad, accept_mxfp8.log) vs bf16 (accept2.log).
 ### BF16 SPEC numbers (pre-guard, spec engaged): live 26.23short/18.98@16k; accept math 0.97/0.93/0.85 code 0.87/0.65/0.53 mean 3.0/2.7.
 (2) 2c mxfp8 drafter + epilogue fusion IF profile confirms draft chunk.
