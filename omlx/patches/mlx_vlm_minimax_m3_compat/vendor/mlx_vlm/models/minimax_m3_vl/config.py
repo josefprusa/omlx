@@ -94,6 +94,7 @@ class TextConfig(BaseModelConfig):
     index_local_blocks: Optional[int] = None
     attention_output_gate: bool = False
     architectures: Optional[List[str]] = None
+    omlx_moe_nvfp4_ts: bool = False
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

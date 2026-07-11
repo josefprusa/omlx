@@ -1,4 +1,5 @@
 from functools import partial
+import logging
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -24,6 +25,8 @@ from .msa import (
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
 _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN = 32768
 _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK = 2
+_MSA_DECODE_ENGAGEMENT_LOGGED = False
+logger = logging.getLogger(__name__)
 
 
 def _is_bool_mask(mask: mx.array) -> bool:
@@ -580,6 +583,7 @@ class MiniMaxPackedSwitchGLU(nn.Module):
         num_experts: int,
         activation: MiniMaxSwiGLUOAI,
         bias: bool = False,
+        nvfp4_ts: bool = False,
     ):
         super().__init__()
         self.gate_up_proj = SwitchLinear(
@@ -587,6 +591,23 @@ class MiniMaxPackedSwitchGLU(nn.Module):
         )
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
+        self.hidden_dims = hidden_dims
+        self.nvfp4_ts = nvfp4_ts
+        if nvfp4_ts:
+            self.gate_up_ts = mx.ones((num_experts, 2), dtype=mx.float32)
+            self.down_ts = mx.ones((num_experts,), dtype=mx.float32)
+
+    def _gate_up_ts_row(self) -> Optional[mx.array]:
+        if not self.nvfp4_ts:
+            return None
+        ts = self.gate_up_ts
+        return mx.concatenate(
+            [
+                mx.broadcast_to(ts[:, :1], (ts.shape[0], self.hidden_dims)),
+                mx.broadcast_to(ts[:, 1:], (ts.shape[0], self.hidden_dims)),
+            ],
+            axis=1,
+        )
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
@@ -600,6 +621,9 @@ class MiniMaxPackedSwitchGLU(nn.Module):
             idx = mx.stop_gradient(idx)
 
         gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+        ts_row = self._gate_up_ts_row()
+        if ts_row is not None:
+            gate_up = gate_up.astype(mx.float32) * mx.expand_dims(ts_row[idx], -2)
         gate, up = mx.split(gate_up, 2, axis=-1)
         x = self.down_proj(
             self.activation(up, gate),
@@ -1146,6 +1170,15 @@ class MiniMaxAttention(nn.Module):
         topk_all_valid: bool = False,
         q_positions: Optional[mx.array] = None,
     ):
+        global _MSA_DECODE_ENGAGEMENT_LOGGED
+        if not _MSA_DECODE_ENGAGEMENT_LOGGED:
+            logger.info(
+                "MiniMax M3 sparse decode engaged: kv_len=%d topk_blocks=%d block_size=%d",
+                keys.shape[2],
+                self.sparse_topk_blocks,
+                self.sparse_block_size,
+            )
+            _MSA_DECODE_ENGAGEMENT_LOGGED = True
         B, H, L, D = queries.shape
         _, K, total_len, _ = keys.shape
         index_heads = topk_idx.shape[1]
@@ -1382,6 +1415,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
                 args.intermediate_size,
                 args.num_local_experts + 1,
                 activation=activation,
+                nvfp4_ts=args.omlx_moe_nvfp4_ts,
             )
         else:
             self.switch_mlp = SwitchGLU(
@@ -1406,6 +1440,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
             mx.zeros((args.num_local_experts,)) if args.use_routing_bias else None
         )
         self.sharding_group = None
+        self.nvfp4_ts = args.omlx_moe_nvfp4_ts
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.sharding_group is not None:
@@ -1441,7 +1476,11 @@ class MiniMaxSparseMoeBlock(nn.Module):
             scores = mx.concatenate([scores, shared_scores], axis=-1)
 
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        if self.nvfp4_ts:
+            scores = scores.astype(mx.float32) * self.switch_mlp.down_ts[inds]
+            y = (y.astype(mx.float32) * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        else:
+            y = (y * scores[..., None]).sum(axis=-2)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
@@ -1829,8 +1868,11 @@ class LanguageModel(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(k):
-            keep_fp32 = "e_score_correction_bias" in k or k.endswith(
-                "block_sparse_moe.gate.weight"
+            keep_fp32 = (
+                "e_score_correction_bias" in k
+                or k.endswith("block_sparse_moe.gate.weight")
+                or k.endswith(".switch_mlp.gate_up_ts")
+                or k.endswith(".switch_mlp.down_ts")
             )
             return not keep_fp32
 
