@@ -230,6 +230,12 @@ def maybe_apply_pre_load_patches(
         if apply_hy_v3_patch():
             logger.info("Hy3 pre-load patch applied for %s", model_name)
 
+    if model_type == "nemotron_h_puzzle":
+        from ..patches.nemotron_h_puzzle import apply_nemotron_h_puzzle_patch
+
+        if apply_nemotron_h_puzzle_patch():
+            logger.info("NemotronH Puzzle pre-load patch applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None
