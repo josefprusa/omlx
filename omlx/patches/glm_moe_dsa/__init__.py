@@ -56,17 +56,16 @@ def _register_module() -> None:
 
 
 def _register_cache_handlers() -> None:
-    """Register the int8 MLA latent cache handler so omlx hot/SSD caching
-    round-trips Int8MLALatentCache. Idempotent (register overwrites by type)."""
+    """Register the thresholded int8 MLA-KV cache handler."""
     try:
         from omlx.cache.type_registry import CacheTypeRegistry
 
-        from .int8_latent_cache import Int8MLALatentCacheHandler
+        from .int8_mla_kv import Int8MLAKVCacheHandler
 
-        CacheTypeRegistry.register(Int8MLALatentCacheHandler())
-        logger.info("Int8MLALatentCacheHandler registered")
+        CacheTypeRegistry.register(Int8MLAKVCacheHandler())
+        logger.info("Int8MLAKVCacheHandler registered")
     except Exception as e:  # pragma: no cover - non-fatal; cache falls back to default
-        logger.warning("Could not register Int8MLALatentCacheHandler: %s", e)
+        logger.warning("Could not register Int8MLAKVCacheHandler: %s", e)
 
 
 def apply_glm_moe_dsa_patch() -> bool:

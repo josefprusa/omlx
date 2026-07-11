@@ -40,9 +40,8 @@ class CacheType(Enum):
     BATCH_POOLING_CACHE = "BatchPoolingCache"
     MINIMAX_M3_KVCACHE = "MiniMaxM3KVCache"
     MINIMAX_M3_BATCH_KVCACHE = "MiniMaxM3BatchKVCache"
-    # GLM-5.2 int8-quantized MLA latent cache (handler in
-    # patches/glm_moe_dsa/int8_latent_cache.py, registered on patch apply).
-    INT8_MLA_LATENT = "Int8MLALatentCache"
+    # Thresholded int8 MLA-KV cache; registered by the GLM patch.
+    INT8_MLA_KV = "Int8MLAKVCache"
 
 
 @dataclass
@@ -895,6 +894,23 @@ class CacheListHandler(CacheTypeHandler):
         sub_meta_states = []
 
         for sc in sub_caches:
+            native_export = getattr(sc, "native_kv_state", None)
+            if callable(native_export):
+                native_state, native_class, native_meta = native_export()
+                sub_states.append(tuple(native_state))
+                sub_class_names.append(native_class)
+                sub_meta_states.append(native_meta)
+                continue
+
+            fp16_export = getattr(sc, "fp16_kv_state", None)
+            if callable(fp16_export):
+                sub_states.append(tuple(fp16_export()))
+                sub_class_names.append(
+                    getattr(sc, "fp16_kv_class_name", "KVCache")
+                )
+                sub_meta_states.append("")
+                continue
+
             # Get state
             if hasattr(sc, "state"):
                 sub_states.append(sc.state)

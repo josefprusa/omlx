@@ -42,6 +42,9 @@ UNIVERSAL_PROFILE_FIELDS = (
 
 # Model-specific fields — eligible for per-model profiles only (never templates).
 MODEL_SPECIFIC_PROFILE_FIELDS = (
+    "int8_mla_kv_enabled",
+    "int8_mla_kv_bits",
+    "int8_mla_kv_start",
     "turboquant_kv_enabled",
     "turboquant_kv_bits",
     "turboquant_skip_last",

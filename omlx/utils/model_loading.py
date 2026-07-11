@@ -638,8 +638,10 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         model, "make_cache"
     ):
         bits = int(getattr(model_settings, "int8_mla_kv_bits", 8) or 8)
+        start = int(getattr(model_settings, "int8_mla_kv_start", 0) or 0)
         model._int8_mla_kv_bits = bits
-        logger.info(f"int8 MLA-KV cache enabled: bits={bits}")
+        model._int8_mla_kv_start = start
+        logger.info(f"int8 MLA-KV cache enabled: bits={bits} start={start}")
         if bits != 8:
             # Only the 8-bit sparse-MLA kernel is built. Other bit-widths still
             # save KV memory but have NO native kernel, so long-context prefill

@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -24,13 +25,17 @@ from .sparse_mla import (
     sparse_mla_attention,
     sparse_mla_attention_q8,
 )
-from .int8_latent_cache import (
-    BatchInt8MLALatentCache,
-    Int8MLALatentCache,
-    dequantize_latent,
-)
+from .int8_mla_kv import BatchInt8MLAKVCache, Int8MLAKVCache
 
-_INT8_LATENT_CACHES = (Int8MLALatentCache, BatchInt8MLALatentCache)
+_INT8_LATENT_CACHES = (Int8MLAKVCache, BatchInt8MLAKVCache)
+_INT8_LOGGED: set[str] = set()
+_int8_logger = logging.getLogger("omlx.glm_dko")
+
+
+def _log_int8_once(message: str) -> None:
+    if message not in _INT8_LOGGED:
+        _INT8_LOGGED.add(message)
+        _int8_logger.warning(message)
 
 
 def _native_sparse_mla_default_min_k() -> str:
@@ -224,10 +229,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             if isinstance(cache[0], _INT8_LATENT_CACHES):
                 q_gs = cache[0].group_size
                 q_bits = cache[0].bits
-                quant_latent, k_pe = cache[0].update_and_fetch(
-                    kv_latent, k_pe, return_quantized=True
-                )
-                kv_latent = None
+                latent_state, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
+                if isinstance(latent_state, tuple):
+                    quant_latent = latent_state
+                    kv_latent = None
+                    _log_int8_once(
+                        f"[INT8KV] ENGAGED bits={q_bits} gs={q_gs} start={cache[0].start}"
+                    )
+                else:
+                    kv_latent = latent_state
             else:
                 kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
         else:
@@ -248,14 +258,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     packed, scales, biases = quant_latent
                     pidx = mx.broadcast_to(idx, idx.shape[:-1] + (packed.shape[-1],))
                     sidx = mx.broadcast_to(idx, idx.shape[:-1] + (scales.shape[-1],))
-                    kv_latent = dequantize_latent(
-                        (
-                            mx.take_along_axis(packed, pidx, axis=2),
-                            mx.take_along_axis(scales, sidx, axis=2),
-                            mx.take_along_axis(biases, sidx, axis=2),
-                        ),
-                        q_gs,
-                        q_bits,
+                    kv_latent = mx.dequantize(
+                        mx.take_along_axis(packed, pidx, axis=2),
+                        mx.take_along_axis(scales, sidx, axis=2),
+                        mx.take_along_axis(biases, sidx, axis=2),
+                        group_size=q_gs,
+                        bits=q_bits,
                     )
                 else:
                     kv_latent = mx.take_along_axis(
@@ -273,7 +281,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 if mask is not None:
                     mask = mx.take_along_axis(mask, topk_indices, axis=-1)
             elif quant_latent is not None:
-                kv_latent = dequantize_latent(quant_latent, q_gs, q_bits)
+                kv_latent = mx.dequantize(
+                    *quant_latent, group_size=q_gs, bits=q_bits
+                )
 
             # Ensure the indexer cache is evaluated even if the topk_indices are unused
             # to keep the graph from getting too large.
@@ -324,7 +334,17 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             and topk_prefix_rows == 0
         ):
             idx = topk_indices[0, 0]  # (L, topk)
-            kv_rows = kv_latent[0, 0][idx]  # (L, topk, latent)
+            if quant_latent is not None:
+                packed, scales, biases = quant_latent
+                kv_rows = mx.dequantize(
+                    packed[0, 0][idx],
+                    scales[0, 0][idx],
+                    biases[0, 0][idx],
+                    group_size=q_gs,
+                    bits=q_bits,
+                )
+            else:
+                kv_rows = kv_latent[0, 0][idx]  # (L, topk, latent)
             pe_rows = k_pe[0, 0][idx]  # (L, topk, rope)
             q_lat = self.embed_q(q_nope)  # (1, H, L, latent)
             qg = q_lat.transpose(0, 2, 1, 3)[0][:, :, None]  # (L, H, 1, latent)
@@ -333,9 +353,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             # The native indexer emits causally valid indices, but the
             # argpartition fallback can select future rows; mask gathered
             # keys past each row's own absolute position.
-            row_pos = mx.arange(
-                kv_latent.shape[2] - L, kv_latent.shape[2], dtype=idx.dtype
+            total_k = (
+                quant_latent[0].shape[2]
+                if quant_latent is not None
+                else kv_latent.shape[2]
             )
+            row_pos = mx.arange(total_k - L, total_k, dtype=idx.dtype)
             valid = idx <= row_pos[:, None]  # (L, topk)
             pe_scores = mx.where(
                 valid[:, None, None, :],
@@ -429,7 +452,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         # only reach here below min_k or if the native kernel declined, so the
         # context is small and the one-shot dequant transient is harmless.
         if quant_latent is not None and kv_latent is None:
-            kv_latent = dequantize_latent(quant_latent, q_gs, q_bits)
+            kv_latent = mx.dequantize(
+                *quant_latent, group_size=q_gs, bits=q_bits
+            )
 
         if topk_indices is not None and L > 8:
             k = self.embed_q(kv_latent, transpose=False)
@@ -580,12 +605,18 @@ class Model(DSV32Model):
         # model settings); the latent is stored int8 and dequantized on read, so
         # attention is unchanged. Falls back to fp16 KVCache when disabled.
         bits = getattr(self, "_int8_mla_kv_bits", None)
+        start = int(getattr(self, "_int8_mla_kv_start", 0) or 0)
 
         def _latent():
             if bits:
-                from .int8_latent_cache import Int8MLALatentCache
+                from .int8_mla_kv import Int8MLAKVCache
 
-                return Int8MLALatentCache(bits=int(bits))
+                return Int8MLAKVCache(
+                    group_size=64,
+                    bits=int(bits),
+                    start=start,
+                    latent_dim=self.args.kv_lora_rank,
+                )
             return KVCache()
 
         caches = []

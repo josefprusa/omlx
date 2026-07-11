@@ -1086,6 +1086,8 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "BatchTurboQuantKVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
+        "Int8MLAKVCache",
+        "BatchInt8MLAKVCache",
     }
 )
 
@@ -1525,6 +1527,8 @@ class Scheduler:
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
+        self._int8_mla_kv_bits: int | None = None
+        self._int8_mla_kv_start: int = 0
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
@@ -2898,6 +2902,46 @@ class Scheduler:
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
+    def _apply_int8_mla_kv_restore(self, prompt_cache: list[Any]) -> None:
+        """Align restored MLA latent caches with the active int8 setting."""
+        if not prompt_cache:
+            return
+        try:
+            from mlx_lm.models.cache import CacheList, KVCache
+
+            from .patches.glm_moe_dsa.int8_mla_kv import Int8MLAKVCache
+        except ImportError:
+            return
+
+        if self._int8_mla_kv_bits is None:
+            for cache_obj in prompt_cache:
+                if not isinstance(cache_obj, CacheList) or not cache_obj.caches:
+                    continue
+                first = cache_obj.caches[0]
+                if isinstance(first, Int8MLAKVCache):
+                    cache_obj.caches = (first.to_kv(), *cache_obj.caches[1:])
+            return
+
+        bits = int(self._int8_mla_kv_bits)
+        start = int(self._int8_mla_kv_start or 0)
+        for cache_obj in prompt_cache:
+            if not isinstance(cache_obj, CacheList) or not cache_obj.caches:
+                continue
+            first = cache_obj.caches[0]
+            if isinstance(first, Int8MLAKVCache):
+                continue
+            if type(first) is not KVCache or first.keys is None:
+                continue
+            keys = first.keys
+            if keys.ndim != 4 or keys.shape[1] != 1 or keys.shape[-1] % 64 != 0:
+                continue
+            cache_obj.caches = (
+                Int8MLAKVCache.from_kv(
+                    first, group_size=64, bits=bits, start=start
+                ),
+                *cache_obj.caches[1:],
+            )
+
     def _do_external_prefill(
         self,
         request: "Request",
@@ -2941,11 +2985,14 @@ class Scheduler:
                     self._apply_turboquant_kv_empty(cache)
                 else:
                     self._apply_turboquant_kv_convert(cache)
+            if existing_cache is not None:
+                self._apply_int8_mla_kv_restore(cache)
             return cache, tokens
 
         # Create or reuse cache
         if existing_cache is not None:
             prompt_cache = existing_cache
+            self._apply_int8_mla_kv_restore(prompt_cache)
         else:
             prompt_cache = make_prompt_cache(self.model)
 
@@ -5848,6 +5895,8 @@ class Scheduler:
                             extracted.append(
                                 {
                                     "state": sub_states,
+                                    "sub_class_names": sub_class_names,
+                                    "sub_meta_states": sub_meta_states,
                                     "meta_state": (
                                         sub_class_names,
                                         sub_meta_states,

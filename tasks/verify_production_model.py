@@ -33,6 +33,8 @@ async def run(args: argparse.Namespace) -> dict:
         settings.int8_mla_kv_enabled = True
         settings.int8_mla_kv_bits = 8
         settings.int8_mla_kv_start = args.int8_start
+    if args.disable_mtp:
+        settings.mtp_enabled = False
 
     engine_cls = VLMBatchedEngine if args.vlm else BatchedEngine
     engine = engine_cls(
@@ -109,6 +111,7 @@ def main() -> None:
     parser.add_argument("--settings-id")
     parser.add_argument("--vlm", action="store_true")
     parser.add_argument("--int8-start", type=int)
+    parser.add_argument("--disable-mtp", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--padding-words", type=int, default=0)
     parser.add_argument(

@@ -153,6 +153,7 @@ class ModelSettings:
     # hot RAM and SSD cold tiers). Independent of TurboQuant (which is MLA-disabled).
     int8_mla_kv_enabled: bool = False
     int8_mla_kv_bits: int = 8  # 8 = int8 (recommended); 4 trades accuracy for memory
+    int8_mla_kv_start: int = 0
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
@@ -243,6 +244,10 @@ class ModelSettings:
             raise ValueError(
                 "mtp_enabled and dflash_enabled cannot both be True; choose one "
                 "speculative-decoding path per model"
+            )
+        if self.int8_mla_kv_enabled and self.turboquant_kv_enabled:
+            raise ValueError(
+                "int8_mla_kv_enabled and turboquant_kv_enabled cannot both be True"
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path

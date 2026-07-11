@@ -73,8 +73,8 @@ class CacheTypeRegistry:
         "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
         "MiniMaxM3KVCache": CacheType.MINIMAX_M3_KVCACHE,
         "MiniMaxM3BatchKVCache": CacheType.MINIMAX_M3_BATCH_KVCACHE,
-        # GLM-5.2 int8 MLA latent cache; handler registered on glm_moe_dsa patch apply.
-        "Int8MLALatentCache": CacheType.INT8_MLA_LATENT,
+        "Int8MLAKVCache": CacheType.INT8_MLA_KV,
+        "BatchInt8MLAKVCache": CacheType.INT8_MLA_KV,
     }
 
     # Default handler instance
@@ -101,6 +101,14 @@ class CacheTypeRegistry:
             Handler for the cache type, or default handler if not found
         """
         handler = cls._handlers.get(cache_type)
+        if handler is None and cache_type is CacheType.INT8_MLA_KV:
+            try:
+                from ..patches.glm_moe_dsa.int8_mla_kv import Int8MLAKVCacheHandler
+
+                cls.register(Int8MLAKVCacheHandler())
+                handler = cls._handlers.get(cache_type)
+            except Exception as exc:
+                logger.warning("Int8MLAKVCacheHandler lazy-register failed: %s", exc)
         if handler is None:
             logger.debug(f"No handler for {cache_type}, using default")
             return cls._default_handler

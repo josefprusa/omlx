@@ -425,6 +425,17 @@ class BatchedEngine(BaseEngine):
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
+            int8_bits = getattr(self._model, "_int8_mla_kv_bits", None)
+            if int8_bits:
+                scheduler._int8_mla_kv_bits = int(int8_bits)
+                scheduler._int8_mla_kv_start = int(
+                    getattr(self._model, "_int8_mla_kv_start", 0) or 0
+                )
+                logger.info(
+                    "int8 MLA-KV scheduler restore conversion armed: bits=%s start=%s",
+                    scheduler._int8_mla_kv_bits,
+                    scheduler._int8_mla_kv_start,
+                )
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler

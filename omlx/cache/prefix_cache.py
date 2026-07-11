@@ -2037,6 +2037,16 @@ class BlockAwarePrefixCache(CacheManager):
                             or CacheTypeRegistry.is_rotating_family(class_name)
                         )
 
+                    subs_normalized_to_fp16: set[int] = set()
+
+                    def _sub_quant_params(sub_meta) -> tuple[int, int]:
+                        if isinstance(sub_meta, (list, tuple)) and len(sub_meta) >= 3:
+                            try:
+                                return int(sub_meta[1]), int(sub_meta[2])
+                            except (TypeError, ValueError):
+                                pass
+                        return 64, 8
+
                     if len(cl_block_data) > 1:
                         # Per-block storage: concatenate sliceable sub-caches
                         # element-wise; pick last block for non-sliceable.
@@ -2059,6 +2069,34 @@ class BlockAwarePrefixCache(CacheManager):
                             per_block_elements = [
                                 _sub_state_elements(bd[j]) for bd in cl_block_data
                             ]
+                            if {len(e) for e in per_block_elements} == {2, 4}:
+                                sub_meta = None
+                                if (
+                                    last_block_meta_states
+                                    and layer_idx < len(last_block_meta_states)
+                                    and len(last_block_meta_states[layer_idx]) >= 2
+                                    and j < len(last_block_meta_states[layer_idx][1])
+                                ):
+                                    sub_meta = last_block_meta_states[layer_idx][1][j]
+                                group_size, bits = _sub_quant_params(sub_meta)
+                                per_block_elements = [
+                                    (
+                                        [
+                                            mx.dequantize(
+                                                e[0],
+                                                e[1],
+                                                e[2],
+                                                group_size=group_size,
+                                                bits=bits,
+                                            ),
+                                            e[3],
+                                        ]
+                                        if len(e) == 4
+                                        else e
+                                    )
+                                    for e in per_block_elements
+                                ]
+                                subs_normalized_to_fp16.add(j)
                             num_elems = len(per_block_elements[-1])
                             cat_elements = []
                             for k in range(num_elems):
@@ -2115,7 +2153,7 @@ class BlockAwarePrefixCache(CacheManager):
                         # keep their last-block meta intact — the sliding
                         # window offset / pool length already encode the
                         # boundary state from the original snapshot.
-                        class_names = meta_state[0]
+                        class_names = list(meta_state[0])
                         adjusted_sub_metas = []
                         for j in range(num_sub_caches):
                             orig_sub_meta = (
@@ -2126,6 +2164,11 @@ class BlockAwarePrefixCache(CacheManager):
                                 if j < len(sub_class_names_for_layer)
                                 else ""
                             )
+                            if j in subs_normalized_to_fp16:
+                                if j < len(class_names):
+                                    class_names[j] = "KVCache"
+                                adjusted_sub_metas.append("")
+                                continue
                             if _is_non_sliceable_sub_class(sub_class):
                                 adjusted_sub_metas.append(
                                     orig_sub_meta if orig_sub_meta else ""
