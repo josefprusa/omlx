@@ -158,3 +158,55 @@ MLX 0.32.0, and mlx-lm 0.31.3.
   load, target-Mac speed result, or quality result.
 - Decision: do not create `experiment/hy3-mtp-delta`; preserve it as research
   until a real current-model proof establishes a benefit.
+
+## Production Model Verification
+
+Verified on 2026-07-11 through the direct omlx serving engines with MLX 0.32.0.
+These are smoke and engagement measurements, not controlled old-versus-new
+benchmarks.
+
+### MiniMax M3 oQNVFP4 fused
+
+- Artifact: `MiniMax-M3-oQNVFP4-fused`, 230 GiB on disk.
+- Initial result: strict load failed on 114 unbound `gate_up_ts`/`down_ts`
+  tensors. This refuted the earlier unit-test-only compatibility verdict.
+- Fix: `rebuild/core` commit `9c036e42` restores the per-expert NVFP4 global
+  tensor-scale fold and adds one-shot sparse-decode engagement telemetry.
+- Short serving result: strict VLM load `35.431s`, peak `235.323 GiB`, correct
+  output, `28.351 tok/s` over 36 measured decode tokens.
+- 5k result: `5,191` prompt tokens, sparse MSA engaged with 16 blocks of 128,
+  peak `295.125 GiB`, `21.621 tok/s` over 31 measured decode tokens.
+- Regression proof: MiniMax/VLM focused gate `107 passed`; the later full GLM
+  branch suite also covered this commit.
+
+### Nemotron Puzzle oQ48
+
+- Artifact: `NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-oQ48`, 44 GiB on disk.
+- Branch head during proof: `experiment/nemotron-puzzle-oq@0639a650`.
+- Serving result: strict batched-engine load `7.285s`, peak `44.659 GiB`,
+  correct output, `60.353 tok/s` over 51 measured decode tokens.
+- This confirms the actual serving wrapper, tokenizer, scheduler, and teardown;
+  it supplements the earlier direct artifact and byte-parity gates.
+
+### GLM-5.2 Alis 4.5bpw with int8 MLA-KV
+
+- Artifact: `GLM-5.2-Alis-MLX-Dynamic-4.5bpw`, 395 GiB on disk.
+- Branch: `experiment/glm52-kernels-mtp`; focused replay commits `dba30e24`
+  and `16c8d406`, finalized for current cache/scheduler contracts by `4e1ee51f`.
+- Kept: thresholded `Int8MLAKVCache`, native int8 block persistence,
+  cross-mode and mixed-era restores, q8 native sparse MLA, scheduler restore
+  conversion, and settings/profile wiring.
+- Serving proof with MTP disabled and int8 forced at token 1: native kernels
+  loaded, `[INT8KV] ENGAGED` logged, strict load `71.193s`, peak
+  `399.155 GiB`, coherent output containing the correct calculation, and
+  `21.756 tok/s` over 63 measured decode tokens.
+- Tests: broad cache/scheduler gate `736 passed`; full repository gate with
+  native kernels built produced `6,491 passed, 23 skipped, 67 deselected`.
+- Blocker: the persisted production setting has MTP enabled, but its graft
+  fails strict load because runtime expects `(256, 6144, 256)` while the shard
+  supplies `(256, 6144, 192)`. Int8 is independently verified; MTP is not.
+- Missing rail: two attempts to repeat the smoke beyond the exact production
+  `int8_mla_kv_start=4096` threshold were killed by macOS with exit 137 during
+  the 395 GiB model materialization, before generation. The threshold behavior,
+  native persistence, and real start=1 engagement are tested, but the current
+  real 4k-context leg remains unverified.
