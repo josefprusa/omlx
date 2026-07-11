@@ -236,6 +236,12 @@ def maybe_apply_pre_load_patches(
         if apply_nemotron_h_puzzle_patch():
             logger.info("NemotronH Puzzle pre-load patch applied for %s", model_name)
 
+    if model_type == "nemotron_h" and config.get("omlx_moe_nvfp4_ts"):
+        from ..patches.nemotron_h_nvfp4_ts import apply_nemotron_h_nvfp4_ts_patch
+
+        if apply_nemotron_h_nvfp4_ts_patch():
+            logger.info("NemotronH NVFP4 scale patch applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None
