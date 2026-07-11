@@ -47,8 +47,12 @@ from mlx_lm.models.cache import (
 from mlx_lm.sample_utils import make_logits_processors
 
 from .cache.observability import CacheRateTracker
-from .cache.paged_cache import PagedCacheManager
-from .cache.prefix_cache import BlockAwarePrefixCache
+from .cache.paged_cache import (
+    PagedCacheManager,
+    compute_block_hash,
+    resolve_block_extra_keys,
+)
+from .cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry
 from .exceptions import PrefillMemoryExceededError, is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
@@ -222,6 +226,17 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Ignoring invalid float env %s=%r", name, value)
+        return default
+
+
 def _collect_mx_arrays(value, out: list[mx.array]) -> None:
     if isinstance(value, mx.array):
         out.append(value)
@@ -304,6 +319,18 @@ class _StoreCacheGate:
         """
         with self._lock:
             return self._in_flight < self._cap
+
+
+@dataclass
+class _EarlyCacheIndexPublish:
+    request_id: str
+    block_table: Any
+    existing_block_count: int
+    existing_tokens: int
+    allocated_block_ids: tuple[int, ...]
+    appended_block_ids: tuple[int, ...]
+    first_new_block_idx: int | None
+    persisted_block_ids: set[int] = field(default_factory=set)
 
 
 # Import tiered cache components
@@ -2020,6 +2047,386 @@ class Scheduler:
                             arrays.append(val)
         return arrays
 
+    def _early_index_publish_disabled(self) -> bool:
+        return os.environ.get("OMLX_DISABLE_EARLY_INDEX_PUBLISH") == "1"
+
+    def _publish_cache_index_metadata(
+        self,
+        request_id: str,
+        tokens: list[int],
+        *,
+        extra_keys: tuple[Any, ...] | None,
+        extra_key_token_start: int | None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
+    ) -> _EarlyCacheIndexPublish | None:
+        """Register reusable full-block metadata before async persistence."""
+        if self._early_index_publish_disabled() or not tokens:
+            return None
+        cache = self.block_aware_cache
+        paged = self.paged_cache_manager
+        if cache is None or paged is None:
+            return None
+        if getattr(cache, "paged_cache", None) is not paged:
+            paged = cache.paged_cache
+
+        block_table = paged.get_block_table(request_id)
+        if not block_table:
+            block_table = paged.create_block_table(request_id)
+
+        existing_tokens = block_table.num_tokens
+        existing_block_count = len(block_table.block_ids)
+        new_tokens = tokens[existing_tokens:]
+        if not new_tokens:
+            cache._last_partial_tokens_skipped = 0
+            cache._last_tokens_to_next_block = 0
+            cache._update_prefix_index(
+                tokens,
+                block_table.block_ids,
+                extra_keys=extra_keys,
+            )
+            cache._request_tables[request_id] = BlockCacheEntry(
+                block_table=block_table,
+                last_access=time.time(),
+            )
+            return _EarlyCacheIndexPublish(
+                request_id=request_id,
+                block_table=block_table,
+                existing_block_count=existing_block_count,
+                existing_tokens=existing_tokens,
+                allocated_block_ids=(),
+                appended_block_ids=(),
+                first_new_block_idx=None,
+            )
+
+        num_new_blocks = len(new_tokens) // cache.block_size
+        trailing_partial_tokens = len(new_tokens) % cache.block_size
+        cache._last_partial_tokens_skipped = trailing_partial_tokens
+        cache._last_tokens_to_next_block = (
+            cache.block_size - trailing_partial_tokens
+            if trailing_partial_tokens > 0
+            else 0
+        )
+        if trailing_partial_tokens > 0:
+            cache._partial_block_skips += 1
+            cache._partial_tokens_skipped += trailing_partial_tokens
+
+        allocated_block_ids: list[int] = []
+        appended_block_ids: list[int] = []
+        first_new_block_idx: int | None = None
+
+        for i in range(num_new_blocks):
+            start_idx = i * cache.block_size
+            end_idx = min(start_idx + cache.block_size, len(new_tokens))
+            block_tokens = new_tokens[start_idx:end_idx]
+            global_end = existing_tokens + end_idx
+
+            parent_hash = None
+            if block_table.block_ids:
+                prev_block_id = block_table.block_ids[-1]
+                prev_block = paged.allocated_blocks.get(prev_block_id)
+                if prev_block and prev_block.block_hash:
+                    parent_hash = prev_block.block_hash
+
+            block_extra_keys = resolve_block_extra_keys(
+                global_end,
+                extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+            )
+
+            existing_block = paged.find_cached_block(
+                block_tokens,
+                parent_hash,
+                extra_keys=block_extra_keys,
+            )
+            if existing_block:
+                paged.increment_ref(existing_block.block_id)
+                block_table.block_ids.append(existing_block.block_id)
+                block_table.num_tokens += len(block_tokens)
+                appended_block_ids.append(existing_block.block_id)
+                continue
+
+            if first_new_block_idx is None:
+                first_new_block_idx = len(block_table.block_ids)
+            block = paged.allocate_block()
+            if not block:
+                if not paged.handle_memory_pressure(1):
+                    logger.warning("Cannot allocate block for %s", request_id)
+                    break
+                block = paged.allocate_block()
+                if not block:
+                    break
+
+            block.token_count = len(block_tokens)
+            block_table.block_ids.append(block.block_id)
+            block_table.num_tokens += len(block_tokens)
+            block.block_hash = compute_block_hash(
+                parent_hash,
+                block_tokens,
+                extra_keys=block_extra_keys,
+                model_name=paged.model_name,
+            )
+            paged.register_block_hash(
+                block,
+                block_tokens,
+                parent_hash,
+                extra_keys=block_extra_keys,
+            )
+            allocated_block_ids.append(block.block_id)
+            appended_block_ids.append(block.block_id)
+
+        cache._update_prefix_index(
+            tokens,
+            block_table.block_ids,
+            extra_keys=extra_keys,
+        )
+        cache._request_tables[request_id] = BlockCacheEntry(
+            block_table=block_table,
+            last_access=time.time(),
+        )
+        return _EarlyCacheIndexPublish(
+            request_id=request_id,
+            block_table=block_table,
+            existing_block_count=existing_block_count,
+            existing_tokens=existing_tokens,
+            allocated_block_ids=tuple(allocated_block_ids),
+            appended_block_ids=tuple(appended_block_ids),
+            first_new_block_idx=first_new_block_idx,
+        )
+
+    def _persist_early_published_cache(
+        self,
+        publish: _EarlyCacheIndexPublish,
+        cache_data: list[Any],
+        model_cache_config: Any | None,
+        boundary_snapshots: dict[int, list[Any]] | None,
+        *,
+        hot_cache_write_back: bool,
+    ) -> tuple[bool, Any]:
+        """Persist tensor bytes for blocks whose hashes are already visible."""
+        cache = self.block_aware_cache
+        if cache is None:
+            return False, publish.block_table
+        paged = cache.paged_cache
+        block_table = publish.block_table
+        allocated_to_persist = (
+            set(publish.allocated_block_ids) - publish.persisted_block_ids
+        )
+        if not allocated_to_persist:
+            return True, block_table
+
+        is_tensor_data = (
+            cache_data
+            and isinstance(cache_data, list)
+            and isinstance(cache_data[0], dict)
+            and "state" in cache_data[0]
+        )
+        if not is_tensor_data or cache.paged_ssd_cache is None:
+            return True, block_table
+
+        if model_cache_config:
+            layer_cache_types = model_cache_config.get_type_names()
+            layer_meta_states = [
+                cache_data[i].get("meta_state", ()) if i < len(cache_data) else ()
+                for i in range(model_cache_config.num_layers)
+            ]
+        else:
+            layer_cache_types = [
+                (
+                    layer_state.get(
+                        "class_name", layer_state.get("cache_type", "KVCache")
+                    )
+                    if layer_state.get("class_name", "")
+                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
+                    else layer_state.get("cache_type", "KVCache")
+                )
+                for layer_state in cache_data
+            ]
+            layer_meta_states = [
+                layer_state.get("meta_state", ()) for layer_state in cache_data
+            ]
+
+        cache_seq_len = cache._get_cache_seq_len(cache_data)
+        cache_uses_global_indices = (
+            publish.existing_tokens > 0
+            and cache_seq_len >= publish.existing_tokens + 1
+        )
+        appended_count = len(publish.appended_block_ids)
+        tip_block_saved = False
+
+        for i, block_id in enumerate(publish.appended_block_ids):
+            if block_id not in allocated_to_persist:
+                continue
+            block = paged.allocated_blocks.get(block_id)
+            if block is None or block.block_hash is None:
+                return False, block_table
+
+            start_idx = i * cache.block_size
+            end_idx = start_idx + block.token_count
+            global_start = publish.existing_tokens + start_idx
+            global_end = publish.existing_tokens + end_idx
+            if cache_uses_global_indices:
+                cache_start = global_start
+                cache_end = global_end
+            else:
+                cache_start = start_idx
+                cache_end = end_idx
+
+            is_last_block = i == appended_count - 1
+            block_boundary_tc = publish.existing_tokens + end_idx
+            snapshot_cache_data = None
+            if boundary_snapshots and block_boundary_tc in boundary_snapshots:
+                snapshot_cache_data = boundary_snapshots[block_boundary_tc]
+
+            if (
+                snapshot_cache_data is None
+                and not is_last_block
+                and cache_seq_len > 0
+                and cache_start >= cache_seq_len
+            ):
+                return False, block_table
+
+            block_kv_data = cache._extract_block_tensor_slice(
+                cache_data,
+                cache_start,
+                cache_end,
+                model_cache_config,
+                is_last_block=is_last_block,
+                snapshot_cache_data=snapshot_cache_data,
+            )
+            if not block_kv_data:
+                return False, block_table
+
+            block_meta = layer_meta_states
+            if snapshot_cache_data is not None:
+                block_meta = []
+                for layer_idx, default_meta in enumerate(layer_meta_states):
+                    if (
+                        layer_idx < len(snapshot_cache_data)
+                        and isinstance(snapshot_cache_data[layer_idx], dict)
+                        and snapshot_cache_data[layer_idx].get("meta_state")
+                        and snapshot_cache_data[layer_idx]["meta_state"] != ()
+                    ):
+                        block_meta.append(
+                            snapshot_cache_data[layer_idx]["meta_state"]
+                        )
+                    else:
+                        block_meta.append(default_meta)
+
+            saved = cache.paged_ssd_cache.save_block(
+                block_hash=block.block_hash,
+                cache_data=block_kv_data,
+                token_count=block.token_count,
+                model_name=paged.model_name,
+                layer_cache_types=layer_cache_types,
+                layer_meta_states=block_meta,
+                hot_cache_write_back=hot_cache_write_back,
+            )
+            if not saved:
+                logger.warning(
+                    "Failed to persist early-published cache block %s for %s",
+                    block_id,
+                    publish.request_id,
+                )
+                return False, block_table
+
+            publish.persisted_block_ids.add(block_id)
+            if is_last_block:
+                tip_block_saved = True
+
+        if (
+            tip_block_saved
+            and publish.first_new_block_idx is not None
+            and 0 < publish.first_new_block_idx < len(block_table.block_ids)
+            and layer_cache_types
+            and CacheTypeRegistry is not None
+            and any(CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types)
+        ):
+            prev_tip_id = block_table.block_ids[publish.first_new_block_idx - 1]
+            new_tip_id = block_table.block_ids[-1]
+            prev_tip = paged.allocated_blocks.get(prev_tip_id)
+            new_tip = paged.allocated_blocks.get(new_tip_id)
+            if (
+                prev_tip is not None
+                and prev_tip.block_hash is not None
+                and new_tip is not None
+                and new_tip.block_hash is not None
+            ):
+                superseded = cache._rotating_tip_lineage.pop(
+                    prev_tip.block_hash, None
+                )
+                if superseded is not None:
+                    cache._strip_rotating_payload(superseded)
+                cache._rotating_tip_lineage[new_tip.block_hash] = prev_tip.block_hash
+                if len(cache._rotating_tip_lineage) > 4096:
+                    cache._rotating_tip_lineage.clear()
+
+        return True, block_table
+
+    def _retract_early_cache_index_publish(
+        self,
+        publish: _EarlyCacheIndexPublish,
+    ) -> None:
+        """Remove visibility and ownership for blocks that did not persist."""
+        cache = self.block_aware_cache
+        if cache is None:
+            return
+        paged = cache.paged_cache
+        retract_ids = {
+            block_id
+            for block_id in publish.allocated_block_ids
+            if block_id not in publish.persisted_block_ids
+        }
+        if not retract_ids:
+            return
+
+        prefix_index = getattr(cache, "_prefix_index", None)
+        if isinstance(prefix_index, dict):
+            for block_hash, entry in list(prefix_index.items()):
+                try:
+                    block_ids = entry[1]
+                except Exception:
+                    continue
+                if any(block_id in retract_ids for block_id in block_ids):
+                    prefix_index.pop(block_hash, None)
+
+        removed_tokens = 0
+        for block_id in retract_ids:
+            block = paged.allocated_blocks.get(block_id)
+            if block is None:
+                continue
+            removed_tokens += int(getattr(block, "token_count", 0) or 0)
+            block_hash = block.block_hash
+            if block_hash is not None:
+                paged.cached_block_hash_to_block.pop(block_hash, block.block_id)
+                if getattr(cache, "paged_ssd_cache", None) is not None:
+                    try:
+                        cache.paged_ssd_cache.forget_block(block_hash)
+                    except Exception:
+                        logger.debug(
+                            "Failed to forget retracted early-published block %s",
+                            block_id,
+                            exc_info=True,
+                        )
+            paged.free_block(block_id)
+
+        publish.block_table.block_ids = [
+            block_id
+            for block_id in publish.block_table.block_ids
+            if block_id not in retract_ids
+        ]
+        publish.block_table.num_tokens = max(
+            0,
+            int(getattr(publish.block_table, "num_tokens", 0) or 0)
+            - removed_tokens,
+        )
+        cache._request_tables.pop(publish.request_id, None)
+        logger.warning(
+            "Retracted %d early-published cache block(s) for %s after persist failure",
+            len(retract_ids),
+            publish.request_id,
+        )
+
     def _async_store_cache_worker(
         self,
         request_id: str,
@@ -2031,6 +2438,7 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
+        early_publish: _EarlyCacheIndexPublish | None = None,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -2066,6 +2474,8 @@ class Scheduler:
         threading.RLock so concurrent access from main and worker is safe.
         """
         try:
+            block_table = None
+            persist_ok = True
             # Hold _mx_buffer_access_lock across the worker's mx-buffer
             # access. store_cache eventually drives _extract_tensor_bytes,
             # which reads raw bytes via the buffer protocol; serializing
@@ -2075,7 +2485,15 @@ class Scheduler:
             with _mx_buffer_access_lock:
                 with self._phase_timer("store_cache_worker_sync"):
                     _safe_sync_stream(self._stream)
-                if hot_cache_write_back:
+                if early_publish is not None:
+                    persist_ok, block_table = self._persist_early_published_cache(
+                        early_publish,
+                        cache_to_store,
+                        model_cache_config,
+                        intermediate_snapshots,
+                        hot_cache_write_back=hot_cache_write_back,
+                    )
+                elif hot_cache_write_back:
                     block_table = self.block_aware_cache.store_cache(
                         request_id,
                         token_sequence_to_store,
@@ -2098,6 +2516,12 @@ class Scheduler:
                         extra_key_ranges=extra_key_ranges,
                         hot_cache_write_back=False,
                     )
+            if early_publish is not None and not persist_ok:
+                self._retract_early_cache_index_publish(early_publish)
+                logger.warning(
+                    "Async store_cache persist failed for early-published %s",
+                    request_id,
+                )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -2105,6 +2529,8 @@ class Scheduler:
             if self.block_aware_cache is not None:
                 self.block_aware_cache.clear_request_entry(request_id)
         except Exception as e:
+            if early_publish is not None:
+                self._retract_early_cache_index_publish(early_publish)
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
 
     def _drain_pending_async_removes(self) -> bool:
@@ -3294,21 +3720,52 @@ class Scheduler:
         """
         if n_tokens <= 0:
             return 0.0
-        per_token = 0.0
-        tracker = self._prefill_transient_tracker
-        if tracker is not None:
-            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                per_token = max(
-                    per_token, tracker.last_delta_bytes / tracker.last_n_tokens
-                )
-            if tracker.bytes_per_token > 0:
-                per_token = max(per_token, tracker.bytes_per_token)
+        static_per_token = 0.0
         if self.memory_monitor is not None:
             static = self.memory_monitor.estimate_chunk_transient_bytes(
                 n_tokens, kv_len + n_tokens
             )
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
-            per_token = max(per_token, float(static) / n_tokens)
+            static_per_token = float(static) / n_tokens
+
+        clamp_k = _env_float("OMLX_TRANSIENT_CLAMP_K", 8.0)
+        clamp_limit = (
+            static_per_token * clamp_k
+            if clamp_k > 0 and static_per_token > 0
+            else None
+        )
+
+        def _clamp_tracker_term(label: str, raw: float) -> float:
+            if clamp_limit is None or raw <= clamp_limit:
+                return raw
+            logger.info(
+                "Clamping prefill transient %s estimate from %.2f MB/token "
+                "to %.2f MB/token (static=%.2f MB/token, K=%.2f)",
+                label,
+                raw / 1024**2,
+                clamp_limit / 1024**2,
+                static_per_token / 1024**2,
+                clamp_k,
+            )
+            return clamp_limit
+
+        per_token = 0.0
+        tracker = self._prefill_transient_tracker
+        if tracker is not None:
+            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
+                per_token = max(
+                    per_token,
+                    _clamp_tracker_term(
+                        "last-delta",
+                        tracker.last_delta_bytes / tracker.last_n_tokens,
+                    ),
+                )
+            if tracker.bytes_per_token > 0:
+                per_token = max(
+                    per_token,
+                    _clamp_tracker_term("ewma", tracker.bytes_per_token),
+                )
+        per_token = max(per_token, static_per_token)
         return per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
 
     def _prefill_abort_cap(self) -> int:
@@ -9046,6 +9503,7 @@ class Scheduler:
                         and request._extracted_cache is not None
                     ) or prompt_boundary_store is not None:
                         try:
+                            early_publish = None
                             full_token_sequence = list(request.prompt_token_ids) + list(
                                 request.output_token_ids
                             )
@@ -9180,6 +9638,18 @@ class Scheduler:
                                         # completion fence moves onto this thread.
                                         mx.eval(*pre_eval_arrays)
 
+                            early_publish = self._publish_cache_index_metadata(
+                                request_id,
+                                token_sequence_to_store,
+                                extra_keys=request.vlm_extra_keys_for_cache,
+                                extra_key_token_start=(
+                                    request.vlm_extra_key_token_start_for_cache
+                                ),
+                                extra_key_ranges=(
+                                    request.vlm_extra_key_ranges_for_cache
+                                ),
+                            )
+
                             hot_cache_write_back = (
                                 not self._bypass_hot_cache_under_pressure()
                             )
@@ -9217,10 +9687,16 @@ class Scheduler:
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
                                         hot_cache_write_back,
+                                        early_publish,
                                     )
                                 except BaseException:
                                     if gate is not None:
                                         gate.note_done()
+                                    if early_publish is not None:
+                                        self._retract_early_cache_index_publish(
+                                            early_publish
+                                        )
+                                        early_publish = None
                                     raise
                                 self._inflight_store_futures[request_id] = store_future
                                 self._inflight_store_info[request_id] = (
@@ -9247,6 +9723,7 @@ class Scheduler:
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
                                     hot_cache_write_back,
+                                    early_publish,
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "
@@ -9275,6 +9752,8 @@ class Scheduler:
                                 )
                             self.block_aware_cache.clear_request_entry(request_id)
                         except Exception as e:
+                            if early_publish is not None:
+                                self._retract_early_cache_index_publish(early_publish)
                             logger.debug(
                                 f"Failed to submit async store for {request_id}: {e}"
                             )

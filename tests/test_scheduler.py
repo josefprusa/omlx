@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import json
+import logging
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -31,6 +32,7 @@ from omlx.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
     SchedulingPolicy,
+    _EarlyCacheIndexPublish,
     _PrefillState,
     _StoreCacheGate,
     _VLMMTPDecodeState,
@@ -1856,6 +1858,490 @@ class TestStoreCacheWorkerSync:
         with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
             with pytest.raises(RuntimeError, match="command buffer execution failed"):
                 sched_mod._safe_sync_stream()
+
+
+class TestEarlyCacheIndexPublish:
+    def _make_cache(self, block_size=4):
+        paged = scheduler_module.PagedCacheManager(
+            block_size=block_size,
+            max_blocks=64,
+            model_name="test-model",
+        )
+        cache = scheduler_module.BlockAwarePrefixCache(
+            model=object(),
+            paged_cache_manager=paged,
+            paged_ssd_cache_manager=None,
+        )
+        return paged, cache
+
+    def test_kill_switch_leaves_stock_cache_untouched(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        monkeypatch.setenv("OMLX_DISABLE_EARLY_INDEX_PUBLISH", "1")
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        result = scheduler._publish_cache_index_metadata(
+            "req-1",
+            [1, 2, 3, 4],
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+        )
+
+        assert result is None
+        assert scheduler.block_aware_cache.method_calls == []
+        assert scheduler.paged_cache_manager.method_calls == []
+
+    def test_publish_makes_hash_visible_before_persistence(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        paged, cache = self._make_cache()
+        scheduler.block_aware_cache = cache
+        scheduler.paged_cache_manager = paged
+
+        publish = scheduler._publish_cache_index_metadata(
+            "req-1",
+            [10, 11, 12, 13],
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+        )
+
+        assert publish is not None
+        block_id = publish.allocated_block_ids[0]
+        block = paged.allocated_blocks[block_id]
+        assert block_id not in publish.persisted_block_ids
+        assert paged.cached_block_hash_to_block.get_block(block.block_hash) is block
+        assert cache._request_tables["req-1"].block_table is publish.block_table
+
+    def test_retract_removes_unpersisted_hash_visibility(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        paged, cache = self._make_cache()
+        scheduler.block_aware_cache = cache
+        scheduler.paged_cache_manager = paged
+        publish = scheduler._publish_cache_index_metadata(
+            "req-2",
+            [20, 21, 22, 23],
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+        )
+        block_id = publish.allocated_block_ids[0]
+        block_hash = paged.allocated_blocks[block_id].block_hash
+
+        scheduler._retract_early_cache_index_publish(publish)
+
+        assert block_id not in paged.allocated_blocks
+        assert paged.cached_block_hash_to_block.get_block(block_hash) is None
+        assert "req-2" not in cache._request_tables
+        assert block_id not in publish.block_table.block_ids
+
+    def test_retract_keeps_blocks_that_persisted(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        paged, cache = self._make_cache()
+        scheduler.block_aware_cache = cache
+        scheduler.paged_cache_manager = paged
+        publish = scheduler._publish_cache_index_metadata(
+            "req-3",
+            list(range(30, 38)),
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+        )
+        first_id, second_id = publish.allocated_block_ids
+        publish.persisted_block_ids.add(first_id)
+
+        scheduler._retract_early_cache_index_publish(publish)
+
+        first_block = paged.allocated_blocks[first_id]
+        assert paged.cached_block_hash_to_block.get_block(
+            first_block.block_hash
+        ) is first_block
+        assert second_id not in paged.allocated_blocks
+
+    def test_reader_before_persist_truncates_without_breaking_publisher(
+        self, mock_model, mock_tokenizer
+    ):
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        paged, cache = self._make_cache()
+        ssd = MagicMock()
+        ssd.load_block_with_metadata.return_value = (None, None)
+        ssd.save_block.return_value = True
+        cache.paged_ssd_cache = ssd
+        scheduler.block_aware_cache = cache
+        scheduler.paged_cache_manager = paged
+        publish = scheduler._publish_cache_index_metadata(
+            "req-A",
+            [1, 2, 3, 4],
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+        )
+        block_id = publish.allocated_block_ids[0]
+        block_hash = paged.allocated_blocks[block_id].block_hash
+        paged.increment_ref(block_id)
+        reader_table = BlockTable(
+            request_id="req-B", block_ids=[block_id], num_tokens=4
+        )
+
+        assert cache.reconstruct_cache(reader_table) is None
+        assert reader_table.block_ids == []
+        assert publish.block_table.block_ids == [block_id]
+        assert block_id in paged.allocated_blocks
+
+        cache_data = [
+            {
+                "state": (
+                    mx.zeros((1, 1, 4, 4)),
+                    mx.zeros((1, 1, 4, 4)),
+                ),
+                "cache_type": "KVCache",
+            }
+        ]
+        persisted, _ = scheduler._persist_early_published_cache(
+            publish,
+            cache_data,
+            None,
+            None,
+            hot_cache_write_back=True,
+        )
+
+        assert persisted is True
+        assert ssd.save_block.call_args.kwargs["block_hash"] == block_hash
+        assert ssd.save_block.call_args.kwargs["token_count"] == 4
+
+    def test_mixed_prefix_deindexes_only_unpersisted_tail(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        paged, cache = self._make_cache()
+        ssd = MagicMock()
+        cache.paged_ssd_cache = ssd
+        scheduler.block_aware_cache = cache
+        scheduler.paged_cache_manager = paged
+        publish = scheduler._publish_cache_index_metadata(
+            "req-A",
+            list(range(20, 28)),
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+        )
+        first_id, second_id = publish.allocated_block_ids
+        first_hash = paged.allocated_blocks[first_id].block_hash
+        second_hash = paged.allocated_blocks[second_id].block_hash
+
+        def load(block_hash, promote_to_hot_cache=True):
+            if block_hash == first_hash:
+                return (
+                    [(mx.zeros((1, 1, 4, 4)), mx.zeros((1, 1, 4, 4)))],
+                    {"model_name": "test-model", "num_layers": 1},
+                )
+            return None, None
+
+        ssd.load_block_with_metadata.side_effect = load
+
+        assert cache.reconstruct_cache(publish.block_table) is not None
+        assert publish.block_table.block_ids == [first_id]
+        assert paged.cached_block_hash_to_block.get_block(first_hash) is not None
+        assert paged.cached_block_hash_to_block.get_block(second_hash) is None
+
+    def test_retract_deindexes_but_preserves_reader_reference(
+        self, mock_model, mock_tokenizer
+    ):
+        from omlx.cache.paged_cache import BlockTable
+        from omlx.cache.prefix_cache import BlockCacheEntry
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        paged, cache = self._make_cache()
+        scheduler.block_aware_cache = cache
+        scheduler.paged_cache_manager = paged
+        publish = scheduler._publish_cache_index_metadata(
+            "req-A",
+            [10, 11, 12, 13],
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+        )
+        block_id = publish.allocated_block_ids[0]
+        paged.increment_ref(block_id)
+        reader_table = BlockTable(
+            request_id="req-B",
+            block_ids=[block_id],
+            num_tokens=4,
+        )
+        cache._request_tables["req-B"] = BlockCacheEntry(
+            block_table=reader_table,
+            last_access=0.0,
+        )
+
+        scheduler._retract_early_cache_index_publish(publish)
+
+        assert paged.allocated_blocks[block_id].ref_count == 1
+        assert reader_table.block_ids == [block_id]
+        assert paged.find_cached_block(
+            [10, 11, 12, 13], None, extra_keys=()
+        ) is None
+
+    def test_worker_retracts_when_persistence_fails(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler.paged_cache_manager.get_block_table.return_value = None
+        publish = _EarlyCacheIndexPublish(
+            request_id="req-fail",
+            block_table=MagicMock(),
+            existing_block_count=0,
+            existing_tokens=0,
+            allocated_block_ids=(1,),
+            appended_block_ids=(1,),
+            first_new_block_idx=0,
+        )
+
+        with patch("omlx.scheduler._safe_sync_stream"), patch.object(
+            scheduler,
+            "_persist_early_published_cache",
+            return_value=(False, MagicMock()),
+        ), patch.object(
+            scheduler, "_retract_early_cache_index_publish"
+        ) as retract:
+            scheduler._async_store_cache_worker(
+                "req-fail",
+                [1, 2, 3, 4],
+                [],
+                None,
+                None,
+                None,
+                None,
+                None,
+                early_publish=publish,
+            )
+
+        retract.assert_called_once_with(publish)
+
+    def test_worker_disabled_path_calls_original_store_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.store_cache.return_value = None
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler.paged_cache_manager.get_block_table.return_value = None
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            scheduler._async_store_cache_worker(
+                "req-store",
+                [1, 2, 3, 4],
+                [],
+                None,
+                None,
+                None,
+                None,
+                None,
+                hot_cache_write_back=False,
+                early_publish=None,
+            )
+
+        scheduler.block_aware_cache.store_cache.assert_called_once_with(
+            "req-store",
+            [1, 2, 3, 4],
+            [],
+            model_cache_config=None,
+            boundary_snapshots=None,
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+            hot_cache_write_back=False,
+        )
+
+    def test_cleanup_publishes_before_async_worker_submission(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._store_cache_executor = MagicMock()
+        scheduler._store_cache_executor.submit.return_value = MagicMock()
+        publish = MagicMock(spec=_EarlyCacheIndexPublish)
+        events = []
+
+        request = Request(
+            request_id="req-order",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = []
+        request._extracted_cache = [{"state": "cache"}]
+        request._model_cache_config = None
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        def record_publish(*args, **kwargs):
+            events.append("publish")
+            return publish
+
+        def record_submit(*args, **kwargs):
+            events.append("submit")
+            return MagicMock()
+
+        with (
+            patch.object(
+                scheduler,
+                "_publish_cache_index_metadata",
+                side_effect=record_publish,
+            ),
+            patch.object(
+                scheduler._store_cache_executor,
+                "submit",
+                side_effect=record_submit,
+            ) as submit,
+        ):
+            scheduler._cleanup_finished({request.request_id})
+
+        assert events == ["publish", "submit"]
+        assert submit.call_args.args[-1] is publish
+
+    def test_cleanup_retracts_when_async_worker_submission_fails(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._store_cache_executor = MagicMock()
+        scheduler._store_cache_executor.submit.side_effect = RuntimeError("closed")
+        scheduler._store_cache_gate = MagicMock()
+        publish = MagicMock(spec=_EarlyCacheIndexPublish)
+
+        request = Request(
+            request_id="req-submit-fail",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = []
+        request._extracted_cache = [{"state": "cache"}]
+        request._model_cache_config = None
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        with (
+            patch.object(
+                scheduler,
+                "_publish_cache_index_metadata",
+                return_value=publish,
+            ),
+            patch.object(
+                scheduler, "_retract_early_cache_index_publish"
+            ) as retract,
+        ):
+            scheduler._cleanup_finished({request.request_id})
+
+        scheduler._store_cache_gate.note_submitted.assert_called_once_with()
+        scheduler._store_cache_gate.note_done.assert_called_once_with()
+        retract.assert_called_once_with(publish)
+
+
+class TestPrefillTransientClamp:
+    def _set_estimates(
+        self,
+        scheduler,
+        *,
+        tracker_per_token,
+        static_per_token,
+        n_tokens,
+    ):
+        scheduler._prefill_transient_tracker.update(
+            n_tokens=100,
+            transient_bytes=int(tracker_per_token * 100),
+        )
+        scheduler.memory_monitor = MagicMock()
+        scheduler.memory_monitor.estimate_chunk_transient_bytes.return_value = int(
+            static_per_token * n_tokens
+        )
+        scheduler.memory_monitor.estimate_prompt_kv_bytes.return_value = 0
+
+    def test_clamps_only_poisoned_tracker_terms(
+        self, mock_model, mock_tokenizer, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("OMLX_TRANSIENT_CLAMP_K", "8")
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        n_tokens = 1000
+        static_per_token = 0.14 * 1024**2
+        self._set_estimates(
+            scheduler,
+            tracker_per_token=58 * 1024**2,
+            static_per_token=static_per_token,
+            n_tokens=n_tokens,
+        )
+
+        with caplog.at_level(logging.INFO, logger=scheduler_module.__name__):
+            predicted = scheduler._predicted_chunk_transient(n_tokens, kv_len=4096)
+
+        assert predicted == pytest.approx(
+            static_per_token
+            * 8
+            * n_tokens
+            * scheduler._PREFILL_TRANSIENT_SAFETY
+        )
+        assert "Clamping prefill transient" in caplog.text
+
+    def test_zero_clamp_exactly_preserves_old_max_of_three(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        monkeypatch.setenv("OMLX_TRANSIENT_CLAMP_K", "0")
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        n_tokens = 1000
+        tracker_per_token = 58 * 1024**2
+        self._set_estimates(
+            scheduler,
+            tracker_per_token=tracker_per_token,
+            static_per_token=0.14 * 1024**2,
+            n_tokens=n_tokens,
+        )
+
+        predicted = scheduler._predicted_chunk_transient(n_tokens, kv_len=4096)
+
+        assert predicted == pytest.approx(
+            tracker_per_token
+            * n_tokens
+            * scheduler._PREFILL_TRANSIENT_SAFETY
+        )
+
+    def test_static_estimate_is_never_clamped(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        monkeypatch.setenv("OMLX_TRANSIENT_CLAMP_K", "8")
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        n_tokens = 1000
+        static_per_token = 2 * 1024**2
+        scheduler.memory_monitor = MagicMock()
+        scheduler.memory_monitor.estimate_chunk_transient_bytes.return_value = int(
+            static_per_token * n_tokens
+        )
+        scheduler.memory_monitor.estimate_prompt_kv_bytes.return_value = 0
+
+        predicted = scheduler._predicted_chunk_transient(n_tokens, kv_len=4096)
+
+        assert predicted == pytest.approx(
+            static_per_token
+            * n_tokens
+            * scheduler._PREFILL_TRANSIENT_SAFETY
+        )
+
+    def test_existing_safety_constants_are_unchanged(self):
+        assert Scheduler._PREFILL_ABORT_MARGIN == 0.90
+        assert Scheduler._PREFILL_TRANSIENT_SAFETY == 1.3
 
 
 class TestSchedulerFormatBytes:
