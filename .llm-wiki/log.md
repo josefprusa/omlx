@@ -7,3 +7,4 @@ Active task state belongs outside `.llm-wiki/` in planning tools, issue trackers
 ## Entries
 
 - 2026-07-11: Initialized the durable architecture, domain, decision, operations, and performance map from upstream `d5fcb22a`; recorded the owner-approved branch-protection waiver in [[decisions/branch-and-sync-policy]].
+- 2026-07-11: Added verified early-publication rollback semantics to [[architecture/scheduler-cache-lifecycle]], converted-artifact census and byte-parity requirements to [[operations/parity-validation]], and recurrent identity-rail promotion criteria to [[decisions/experiment-promotion]].
