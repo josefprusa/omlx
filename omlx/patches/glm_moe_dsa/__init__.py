@@ -75,8 +75,10 @@ def apply_glm_moe_dsa_patch() -> bool:
 
     _register_module()
     from .generate_patch import apply_glm_moe_dsa_generate_patch
+    from .nvfp4_ts import apply_glm_nvfp4_ts_patch
 
     apply_glm_moe_dsa_generate_patch()
+    apply_glm_nvfp4_ts_patch()
     _APPLIED = True
     missing = _missing_fast_symbols()
     if missing:

@@ -1,12 +1,26 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import logging
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.models.activations import swiglu
 from .kernels import fast as glm_fast
+
+logger = logging.getLogger(__name__)
+_NVFP4_TS_LOGGED_MODES: set[str] = set()
+
+
+def _nvfp4_ts_disabled() -> bool:
+    disabled = os.environ.get("OMLX_GLM_DISABLE_NVFP4_TS") == "1"
+    mode = "disabled" if disabled else "enabled"
+    if mode not in _NVFP4_TS_LOGGED_MODES:
+        _NVFP4_TS_LOGGED_MODES.add(mode)
+        logger.warning("GLM NVFP4 tensor-scale fold %s", mode)
+    return disabled
 
 
 def _inverse_permutation(order, inverse_scatter=False):
@@ -218,6 +232,15 @@ class SwitchGLU(nn.Module):
         if hasattr(self, "gate_up_proj"):
             x_gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
             x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            if hasattr(self, "gate_up_ts") and not _nvfp4_ts_disabled():
+                ts = self.gate_up_ts[idx]
+                dtype = x_gate.dtype
+                x_gate = (x_gate.astype(mx.float32) * ts[..., 0, None, None]).astype(
+                    dtype
+                )
+                x_up = (x_up.astype(mx.float32) * ts[..., 1, None, None]).astype(
+                    dtype
+                )
             x = self.down_proj(
                 self.activation(x_up, x_gate),
                 idx,
@@ -230,6 +253,10 @@ class SwitchGLU(nn.Module):
                 self.activation(x_up, x_gate),
                 idx,
                 sorted_indices=do_sort,
+            )
+        if hasattr(self, "down_ts") and not _nvfp4_ts_disabled():
+            x = (x.astype(mx.float32) * self.down_ts[idx][..., None, None]).astype(
+                x.dtype
             )
 
         if (
