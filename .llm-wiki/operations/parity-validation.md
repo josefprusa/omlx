@@ -24,6 +24,12 @@ For converted checkpoints, use two independent gates:
 Finish with a strict real-artifact load and a deterministic generation probe.
 Strict loading alone proves tree compatibility, not conversion correctness.
 
+Run the final probe through `BatchedEngine` or `VLMBatchedEngine`, not only a
+library-level loader. Record load time, prompt/completion token counts, first
+token latency, decode rate, peak MLX memory, output, finish reason, and required
+feature-engagement logs. A short prompt cannot certify a context-gated feature;
+cross its real threshold in a separate rail or mark that rail unverified.
+
 ## Provenance
 
 Approved in the upstream rebuild plan and aligned with current tests on 2026-07-11. Revalidated by the 88-layer Puzzle artifact census and 12-source byte-parity samples in Nemotron experiment commit `ce739d7c`.
